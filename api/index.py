@@ -25,10 +25,10 @@ from flask import (
 # CONFIG
 # ============================================================
 
-GMAIL_EMAIL = os.getenv("GMAIL_EMAIL", "")
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
+GMAIL_EMAIL = os.getenv("GMAIL_EMAIL", "hamza.ali.khan6200@gmail.com")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "kdnc botx dmpa qeep")
 
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:pathan@786khan@db.pckwcojlzslvolnxrluh.supabase.co:5432/postgres")
 
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "786")
 FLASK_SECRET = os.getenv("FLASK_SECRET", "change-this-secret")
