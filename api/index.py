@@ -29,17 +29,17 @@ from flask import (
 
 GMAIL_EMAIL = os.getenv(
     "GMAIL_EMAIL",
-    ""
+    "hamza.ali.khan6200@gmail.com"
 )
 
 GMAIL_APP_PASSWORD = os.getenv(
     "GMAIL_APP_PASSWORD",
-    ""
+    "kdnc botx dmpa qeep"
 )
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    ""
+    "postgresql://postgres:pathan@786khan@db.pckwcojlzslvolnxrluh.supabase.co:5432/postgres"
 )
 
 ADMIN_PASSWORD = os.getenv(
@@ -77,7 +77,7 @@ DEFAULT_SCAN_DAYS = int(
 DEFAULT_SCAN_INTERVAL = int(
     os.getenv(
         "DEFAULT_SCAN_INTERVAL",
-        "60"
+        "10"
     )
 )
 
