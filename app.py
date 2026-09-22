@@ -188,8 +188,8 @@ async def health():
     return {
         "success": True,
         "service": "OS GATEWAY",
-        "powered_by": "MODX",
-        "developer": "@MODX",
+        "powered_by": "OS CODEX",
+        "developer": "@khannhamzaa",
         "status": "online",
     }
 
