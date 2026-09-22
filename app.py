@@ -30,7 +30,6 @@ from pydantic import BaseModel
 # ============================================================
 # OS CODEX — UPI PAYMENT GATEWAY
 # Developer: @khannhamzaa
-# Powered by: OS CODEX
 # ============================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -54,32 +53,17 @@ PAYMENT_EXPIRY_MINUTES = 15
 
 ALLOWED_ORIGINS = ["*"]
 
-
-# ============================================================
-# 📧 GMAIL AUTO-VERIFY
-# ============================================================
-
 GMAIL_EMAIL = "hamza.ali.khan6200@gmail.com"
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "kdncbotxdmpaqeep")
-
 FAMAPP_SENDER = "famapp"
 EMAIL_CHECK_INTERVAL = 30
-
-
-# ============================================================
-# 📢 TELEGRAM NOTIFY (optional)
-# ============================================================
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_ADMIN_ID = os.environ.get("TELEGRAM_ADMIN_ID", "")
 
-# ============================================================
-# BRANDING
-# ============================================================
-
-BRAND       = "OS CODEX"
-DEVELOPER   = "@khannhamzaa"
-POWERED_BY  = "OS CODEX"
+BRAND      = "OS CODEX"
+DEVELOPER  = "@khannhamzaa"
+POWERED_BY = "OS CODEX"
 
 # ============================================================
 # END CONFIG
@@ -87,7 +71,7 @@ POWERED_BY  = "OS CODEX"
 
 
 # ============================================================
-# 🛠️ DNS FIX FOR VERCEL
+# DNS FIX FOR VERCEL
 # ============================================================
 
 _original_getaddrinfo = socket.getaddrinfo
@@ -112,11 +96,7 @@ async def get_pool() -> asyncpg.Pool:
     if _pool is None:
         dsn = DATABASE_URL.split("?")[0]
         _pool = await asyncpg.create_pool(
-            dsn=dsn,
-            min_size=1,
-            max_size=3,
-            ssl="require",
-            command_timeout=20,
+            dsn=dsn, min_size=1, max_size=3, ssl="require", command_timeout=20,
         )
     return _pool
 
@@ -144,6 +124,7 @@ async def init_db():
                 currency VARCHAR(8) NOT NULL DEFAULT 'INR',
                 status VARCHAR(16) NOT NULL DEFAULT 'PENDING',
                 transaction_id VARCHAR(128),
+                utr VARCHAR(128),
                 upi_reference VARCHAR(128),
                 payer_name VARCHAR(255),
                 verified_by VARCHAR(32),
@@ -156,12 +137,14 @@ async def init_db():
                 UNIQUE(merchant_id, idempotency_key)
             )
         """)
+        await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS utr VARCHAR(128)")
         await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payer_name VARCHAR(255)")
         await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS verified_by VARCHAR(32)")
 
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_o1 ON orders(order_id)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_o2 ON orders(transaction_id)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_o3 ON orders(merchant_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_o3 ON orders(utr)")
+        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uniq_utr ON orders(utr) WHERE utr IS NOT NULL")
 
 
 @asynccontextmanager
@@ -175,7 +158,6 @@ async def lifespan(app):
     email_task = None
     if GMAIL_EMAIL and GMAIL_APP_PASSWORD:
         email_task = asyncio.create_task(scan_gmail_for_payments())
-        logger.info("Gmail watcher started for %s", GMAIL_EMAIL)
 
     yield
 
@@ -191,12 +173,7 @@ async def lifespan(app):
 # APP
 # ============================================================
 
-app = FastAPI(
-    title="OS CODEX",
-    description="UPI Payment Gateway — by @khannhamzaa",
-    version="2.0.0",
-    lifespan=lifespan,
-)
+app = FastAPI(title="OS CODEX", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -222,17 +199,11 @@ def generate_order_id():
 
 def generate_upi_qr(amount: float, order_id: str):
     params = {
-        "pa": MERCHANT_UPI_ID,
-        "pn": MERCHANT_NAME,
-        "tr": order_id,
-        "am": f"{amount:.2f}",
-        "cu": "INR",
+        "pa": MERCHANT_UPI_ID, "pn": MERCHANT_NAME,
+        "tr": order_id, "am": f"{amount:.2f}", "cu": "INR",
     }
     upi_uri = "upi://pay?" + urllib.parse.urlencode(params)
-    qr = qrcode.QRCode(
-        error_correction=qrcode.constants.ERROR_CORRECT_M,
-        box_size=8, border=4,
-    )
+    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=8, border=4)
     qr.add_data(upi_uri)
     qr.make(fit=True)
     img = qr.make_image(fill_color="black", back_color="white")
@@ -248,13 +219,35 @@ async def find_merchant_by_api_key(api_key: str) -> Optional[str]:
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT merchant_id FROM merchants WHERE api_key_hash=$1",
-            hash_key(api_key),
-        )
+            hash_key(api_key))
     return row["merchant_id"] if row else None
 
 
-async def _mark_order_success(order_id: str, txn_id: str, source: str,
-                              upi_ref: str = None, payer: str = None):
+def order_to_dict(row):
+    """Convert asyncpg row to a clean dict for API response."""
+    if not row:
+        return None
+    return {
+        "order_id": row["order_id"],
+        "merchant_id": row["merchant_id"],
+        "amount": float(row["amount"]),
+        "currency": row["currency"],
+        "status": row["status"],
+        "transaction_id": row["transaction_id"],
+        "utr": row["utr"],
+        "upi_reference": row["upi_reference"],
+        "payer_name": row["payer_name"],
+        "verified_by": row["verified_by"],
+        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        "expires_at": row["expires_at"].isoformat() if row["expires_at"] else None,
+        "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+        "expired": row["status"] == "EXPIRED",
+    }
+
+
+async def _mark_order_success(order_id: str, txn_id: str = None, source: str = "MANUAL",
+                              utr: str = None, payer: str = None):
+    """Mark order SUCCESS. Enforces duplicate UTR/TXN protection."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         order = await conn.fetchrow("SELECT * FROM orders WHERE order_id=$1", order_id)
@@ -263,51 +256,53 @@ async def _mark_order_success(order_id: str, txn_id: str, source: str,
         if order["status"] == "SUCCESS":
             return True, "Already SUCCESS"
 
+        # duplicate checks
+        if utr:
+            dupe = await conn.fetchrow(
+                "SELECT order_id FROM orders WHERE utr=$1 AND status='SUCCESS' AND order_id<>$2",
+                utr, order_id)
+            if dupe:
+                return False, f"UTR already used for order {dupe['order_id']}"
+        if txn_id:
+            dupe = await conn.fetchrow(
+                "SELECT order_id FROM orders WHERE transaction_id=$1 AND status='SUCCESS' AND order_id<>$2",
+                txn_id, order_id)
+            if dupe:
+                return False, f"TXN already used for order {dupe['order_id']}"
+
         await conn.execute(
             """
             UPDATE orders
             SET status='SUCCESS',
-                transaction_id=$1,
-                upi_reference=$2,
-                payer_name=$3,
-                verified_by=$4,
-                webhook_received=1,
-                verified=1,
-                updated_at=$5
-            WHERE order_id=$6
+                transaction_id = COALESCE($1, transaction_id),
+                utr = COALESCE($2, utr),
+                payer_name = COALESCE($3, payer_name),
+                verified_by = $4,
+                webhook_received = 1,
+                verified = 1,
+                updated_at = $5
+            WHERE order_id = $6
             """,
-            txn_id, upi_ref, payer, source, now(), order_id,
-        )
+            txn_id, utr, payer, source, now(), order_id)
         merchant_webhook = order["merchant_webhook_url"]
+        amount = float(order["amount"])
 
     if merchant_webhook:
         try:
             async with httpx.AsyncClient(timeout=10) as c:
                 await c.post(merchant_webhook, json={
-                    "event": "payment.success",
-                    "order_id": order_id,
-                    "amount": float(order["amount"]),
-                    "currency": "INR",
-                    "transaction_id": txn_id,
-                    "upi_reference": upi_ref,
-                    "payer_name": payer,
-                    "status": "SUCCESS",
-                    "verified_by": source,
-                    "timestamp": now_iso(),
-                    "gateway": BRAND,
-                    "developer": DEVELOPER,
+                    "event": "payment.success", "order_id": order_id,
+                    "amount": amount, "currency": "INR",
+                    "transaction_id": txn_id, "utr": utr, "payer_name": payer,
+                    "status": "SUCCESS", "verified_by": source,
+                    "timestamp": now_iso(), "gateway": BRAND, "developer": DEVELOPER,
                 })
         except Exception as e:
             logger.warning("Merchant webhook failed: %s", e)
 
     await _notify_telegram_admin(
-        order_id=order_id,
-        amount=float(order["amount"]),
-        transaction_id=txn_id,
-        upi_reference=upi_ref,
-        payer=payer,
-        source=source,
-    )
+        order_id=order_id, amount=amount,
+        transaction_id=txn_id or utr, payer=payer, source=source)
     return True, "OK"
 
 
@@ -320,12 +315,26 @@ async def _expire_order_if_needed(order_id: str):
         if order["status"] == "PENDING" and now() > order["expires_at"]:
             await conn.execute(
                 "UPDATE orders SET status='EXPIRED', updated_at=$1 WHERE order_id=$2",
-                now(), order_id,
-            )
+                now(), order_id)
             await _notify_telegram_expiry(order_id, float(order["amount"]))
-            order = dict(order)
-            order["status"] = "EXPIRED"
-        return dict(order) if order else None
+            d = dict(order)
+            d["status"] = "EXPIRED"
+            return d
+        return dict(order)
+
+
+async def _find_order_by_any(order_id=None, utr=None, txn=None):
+    """Look up order by order_id, utr, or transaction_id (priority in that order)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = None
+        if order_id:
+            row = await conn.fetchrow("SELECT * FROM orders WHERE order_id=$1", order_id)
+        if not row and utr:
+            row = await conn.fetchrow("SELECT * FROM orders WHERE utr=$1", utr)
+        if not row and txn:
+            row = await conn.fetchrow("SELECT * FROM orders WHERE transaction_id=$1", txn)
+        return dict(row) if row else None
 
 
 # ============================================================
@@ -335,24 +344,18 @@ async def _expire_order_if_needed(order_id: str):
 @app.get("/api/health")
 async def health():
     return {
-        "success": True,
-        "service": BRAND,
-        "powered_by": POWERED_BY,
-        "developer": DEVELOPER,
-        "status": "online",
+        "success": True, "service": BRAND, "powered_by": POWERED_BY,
+        "developer": DEVELOPER, "status": "online",
         "features": {
             "email_auto_verify": bool(GMAIL_EMAIL and GMAIL_APP_PASSWORD),
             "gmail_account": GMAIL_EMAIL if GMAIL_EMAIL else None,
             "telegram_notify": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_ID),
             "manual_utr": True,
+            "utr_window_minutes": PAYMENT_EXPIRY_MINUTES,
             "expiry_minutes": PAYMENT_EXPIRY_MINUTES,
         },
     }
 
-
-# ============================================================
-# 1b. DB TEST
-# ============================================================
 
 @app.get("/api/db-test")
 async def db_test():
@@ -384,102 +387,72 @@ async def create_merchant(
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
-            """
-            INSERT INTO merchants (merchant_id, api_key_hash, name, webhook_url, created_at)
-            VALUES ($1,$2,$3,$4,$5)
-            """,
-            merchant_id, hash_key(raw_key), name, webhook_url, now(),
-        )
+            """INSERT INTO merchants (merchant_id, api_key_hash, name, webhook_url, created_at)
+               VALUES ($1,$2,$3,$4,$5)""",
+            merchant_id, hash_key(raw_key), name, webhook_url, now())
 
-    return {
-        "success": True,
-        "merchant_id": merchant_id,
-        "api_key": raw_key,
-        "name": name,
-        "gateway": BRAND,
-        "developer": DEVELOPER,
-    }
+    return {"success": True, "merchant_id": merchant_id, "api_key": raw_key, "name": name,
+            "gateway": BRAND, "developer": DEVELOPER}
 
-
-# ============================================================
-# 3. LIST MERCHANTS
-# ============================================================
 
 @app.get("/api/admin/merchants")
 async def list_merchants(admin_key: str = Query(...)):
     if admin_key != ADMIN_KEY:
         raise HTTPException(401, {"code": "INVALID_ADMIN_KEY", "message": "Wrong admin key"})
-
     pool = await get_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT merchant_id, name, webhook_url, created_at FROM merchants ORDER BY id DESC"
-        )
+        rows = await conn.fetch("SELECT merchant_id, name, webhook_url, created_at FROM merchants ORDER BY id DESC")
+    return {"success": True, "count": len(rows), "merchants": [
+        {"merchant_id": r["merchant_id"], "name": r["name"],
+         "webhook_url": r["webhook_url"], "created_at": r["created_at"].isoformat()}
+        for r in rows]}
 
-    return {
-        "success": True,
-        "count": len(rows),
-        "merchants": [
-            {
-                "merchant_id": r["merchant_id"],
-                "name": r["name"],
-                "webhook_url": r["webhook_url"],
-                "created_at": r["created_at"].isoformat(),
-            }
-            for r in rows
-        ],
-    }
-
-
-# ============================================================
-# 3b. LIST ORDERS
-# ============================================================
 
 @app.get("/api/admin/orders")
 async def list_orders(
     admin_key: str = Query(...),
     status: Optional[str] = Query(None),
-    limit: int = Query(50),
+    limit: int = Query(100),
 ):
     if admin_key != ADMIN_KEY:
         raise HTTPException(401, {"code": "INVALID_ADMIN_KEY", "message": "Wrong admin key"})
-
     pool = await get_pool()
     async with pool.acquire() as conn:
         if status:
             rows = await conn.fetch(
                 "SELECT * FROM orders WHERE status=$1 ORDER BY id DESC LIMIT $2",
-                status.upper(), limit,
-            )
+                status.upper(), limit)
         else:
-            rows = await conn.fetch(
-                "SELECT * FROM orders ORDER BY id DESC LIMIT $1", limit
-            )
+            rows = await conn.fetch("SELECT * FROM orders ORDER BY id DESC LIMIT $1", limit)
+    return {"success": True, "count": len(rows), "orders": [order_to_dict(r) for r in rows]}
 
-    return {
-        "success": True,
-        "count": len(rows),
-        "orders": [
-            {
-                "order_id": r["order_id"],
-                "merchant_id": r["merchant_id"],
-                "amount": float(r["amount"]),
-                "currency": r["currency"],
-                "status": r["status"],
-                "transaction_id": r["transaction_id"],
-                "upi_reference": r["upi_reference"],
-                "payer_name": r["payer_name"],
-                "verified_by": r["verified_by"],
-                "created_at": r["created_at"].isoformat(),
-                "expires_at": r["expires_at"].isoformat(),
-            }
-            for r in rows
-        ],
-    }
+
+@app.get("/api/admin/stats")
+async def admin_stats(admin_key: str = Query(...)):
+    if admin_key != ADMIN_KEY:
+        raise HTTPException(401, {"code": "INVALID_ADMIN_KEY", "message": "Wrong admin key"})
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        total_orders = await conn.fetchval("SELECT COUNT(*) FROM orders")
+        success_orders = await conn.fetchval("SELECT COUNT(*) FROM orders WHERE status='SUCCESS'")
+        pending_orders = await conn.fetchval("SELECT COUNT(*) FROM orders WHERE status='PENDING'")
+        expired_orders = await conn.fetchval("SELECT COUNT(*) FROM orders WHERE status='EXPIRED'")
+        total_revenue = await conn.fetchval("SELECT COALESCE(SUM(amount),0) FROM orders WHERE status='SUCCESS'")
+        today_revenue = await conn.fetchval(
+            "SELECT COALESCE(SUM(amount),0) FROM orders WHERE status='SUCCESS' AND created_at > NOW() - INTERVAL '1 day'")
+        week_revenue = await conn.fetchval(
+            "SELECT COALESCE(SUM(amount),0) FROM orders WHERE status='SUCCESS' AND created_at > NOW() - INTERVAL '7 days'")
+    return {"success": True, "stats": {
+        "total_orders": total_orders, "success_orders": success_orders,
+        "pending_orders": pending_orders, "expired_orders": expired_orders,
+        "total_revenue": float(total_revenue or 0),
+        "today_revenue": float(today_revenue or 0),
+        "week_revenue": float(week_revenue or 0),
+    }, "gateway": BRAND, "developer": DEVELOPER}
 
 
 # ============================================================
-# 4. CREATE PAYMENT — GET
+# 3. CREATE PAYMENT
 # ============================================================
 
 @app.get("/api/pay/create")
@@ -492,18 +465,12 @@ async def create_payment_get(
     merchant_id = await find_merchant_by_api_key(api_key)
     if not merchant_id:
         raise HTTPException(401, {"code": "INVALID_API_KEY", "message": "Invalid api_key"})
-
     if amount <= 0:
         raise HTTPException(400, {"code": "INVALID_AMOUNT", "message": "amount must be > 0"})
     if amount > MAX_PAYMENT_AMOUNT:
         raise HTTPException(400, {"code": "AMOUNT_EXCEEDED", "message": "amount too large"})
-
     return await _create_order(merchant_id, amount, idempotency_key, request)
 
-
-# ============================================================
-# 5. CREATE PAYMENT — POST
-# ============================================================
 
 class PaymentBody(BaseModel):
     api_key: str
@@ -516,12 +483,10 @@ async def create_payment_post(body: PaymentBody, request: Request):
     merchant_id = await find_merchant_by_api_key(body.api_key)
     if not merchant_id:
         raise HTTPException(401, {"code": "INVALID_API_KEY", "message": "Invalid api_key"})
-
     if body.amount <= 0:
         raise HTTPException(400, {"code": "INVALID_AMOUNT", "message": "amount must be > 0"})
     if body.amount > MAX_PAYMENT_AMOUNT:
         raise HTTPException(400, {"code": "AMOUNT_EXCEEDED", "message": "amount too large"})
-
     return await _create_order(merchant_id, body.amount, body.idempotency_key, request)
 
 
@@ -533,26 +498,17 @@ async def _create_order(merchant_id, amount, idempotency_key, request):
         if idempotency_key:
             existing = await conn.fetchrow(
                 "SELECT * FROM orders WHERE merchant_id=$1 AND idempotency_key=$2",
-                merchant_id, idempotency_key,
-            )
+                merchant_id, idempotency_key)
             if existing:
                 qr, upi = generate_upi_qr(float(existing["amount"]), existing["order_id"])
-                return {
-                    "success": True,
-                    "order_id": existing["order_id"],
-                    "amount": float(existing["amount"]),
-                    "currency": "INR",
-                    "status": existing["status"],
-                    "payment_url": f"{base_url}/pay/{existing['order_id']}",
-                    "upi_uri": upi,
-                    "qr_code": qr,
-                    "gateway": BRAND,
-                    "developer": DEVELOPER,
-                }
+                return {"success": True, "order_id": existing["order_id"],
+                        "amount": float(existing["amount"]), "currency": "INR",
+                        "status": existing["status"],
+                        "payment_url": f"{base_url}/pay/{existing['order_id']}",
+                        "upi_uri": upi, "qr_code": qr,
+                        "gateway": BRAND, "developer": DEVELOPER}
 
-        merchant = await conn.fetchrow(
-            "SELECT webhook_url FROM merchants WHERE merchant_id=$1", merchant_id
-        )
+        merchant = await conn.fetchrow("SELECT webhook_url FROM merchants WHERE merchant_id=$1", merchant_id)
         if not merchant:
             raise HTTPException(404, {"code": "MERCHANT_NOT_FOUND", "message": "Merchant not found"})
 
@@ -561,36 +517,24 @@ async def _create_order(merchant_id, amount, idempotency_key, request):
         expires = created + timedelta(minutes=PAYMENT_EXPIRY_MINUTES)
 
         await conn.execute(
-            """
-            INSERT INTO orders
-            (order_id, merchant_id, idempotency_key, amount, currency, status,
-             created_at, updated_at, expires_at, merchant_webhook_url)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-            """,
+            """INSERT INTO orders
+               (order_id, merchant_id, idempotency_key, amount, currency, status,
+                created_at, updated_at, expires_at, merchant_webhook_url)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)""",
             order_id, merchant_id, idempotency_key, amount, "INR", "PENDING",
-            created, created, expires, merchant["webhook_url"],
-        )
+            created, created, expires, merchant["webhook_url"])
 
     qr, upi = generate_upi_qr(amount, order_id)
-
-    return {
-        "success": True,
-        "order_id": order_id,
-        "amount": amount,
-        "currency": "INR",
-        "status": "PENDING",
-        "payment_url": f"{base_url}/pay/{order_id}",
-        "upi_uri": upi,
-        "qr_code": qr,
-        "expires_at": expires.isoformat(),
-        "expiry_minutes": PAYMENT_EXPIRY_MINUTES,
-        "gateway": BRAND,
-        "developer": DEVELOPER,
-    }
+    return {"success": True, "order_id": order_id, "amount": amount, "currency": "INR",
+            "status": "PENDING", "payment_url": f"{base_url}/pay/{order_id}",
+            "upi_uri": upi, "qr_code": qr,
+            "expires_at": expires.isoformat(),
+            "expiry_minutes": PAYMENT_EXPIRY_MINUTES,
+            "gateway": BRAND, "developer": DEVELOPER}
 
 
 # ============================================================
-# 6. STATUS
+# 4. STATUS
 # ============================================================
 
 @app.get("/api/pay/status")
@@ -598,29 +542,215 @@ async def payment_status(order_id: str = Query(...)):
     order = await _expire_order_if_needed(order_id)
     if not order:
         raise HTTPException(404, {"code": "ORDER_NOT_FOUND", "message": "Order not found"})
-
     st = order["status"]
+    # compute seconds remaining
+    expires_at = order["expires_at"]
+    if isinstance(expires_at, str):
+        try:
+            expires_at = datetime.fromisoformat(expires_at)
+        except Exception:
+            expires_at = None
+    remaining = 0
+    if expires_at and st == "PENDING":
+        remaining = max(0, int((expires_at - now()).total_seconds()))
+
+    return {"success": True, "order_id": order["order_id"],
+            "amount": float(order["amount"]), "currency": order["currency"],
+            "status": st,
+            "transaction_id": order["transaction_id"],
+            "utr": order["utr"],
+            "upi_reference": order["upi_reference"],
+            "payer_name": order["payer_name"],
+            "verified_by": order["verified_by"],
+            "verified": True if st == "SUCCESS" else bool(order["verified"]),
+            "created_at": order["created_at"].isoformat() if hasattr(order["created_at"], "isoformat") else order["created_at"],
+            "expires_at": order["expires_at"].isoformat() if hasattr(order["expires_at"], "isoformat") else order["expires_at"],
+            "seconds_remaining": remaining,
+            "expired": st == "EXPIRED",
+            "can_verify": st == "PENDING",
+            "gateway": BRAND, "developer": DEVELOPER}
+
+
+# ============================================================
+# 5. LOOKUP (info only, no verification)
+# ============================================================
+
+@app.get("/api/pay/lookup")
+async def pay_lookup(
+    order_id: Optional[str] = Query(None),
+    utr: Optional[str] = Query(None),
+    transaction_id: Optional[str] = Query(None),
+):
+    """Look up full payment details WITHOUT changing status."""
+    if not (order_id or utr or transaction_id):
+        raise HTTPException(400, {"code": "MISSING_PARAM",
+                                  "message": "Provide order_id, utr, or transaction_id"})
+
+    order = await _find_order_by_any(order_id, utr, transaction_id)
+    if not order:
+        raise HTTPException(404, {"code": "ORDER_NOT_FOUND", "message": "No matching order"})
+
+    # auto-expire on read
+    if order["status"] == "PENDING":
+        exp = order["expires_at"]
+        if isinstance(exp, str):
+            try:
+                exp = datetime.fromisoformat(exp)
+            except Exception:
+                exp = None
+        if exp and now() > exp:
+            order = await _expire_order_if_needed(order["order_id"])
+            if not order:
+                raise HTTPException(500, {"code": "ERROR", "message": "Expire failed"})
+
+    return {"success": True, "payment": order_to_dict(order),
+            "gateway": BRAND, "developer": DEVELOPER}
+
+
+# ============================================================
+# 6. VERIFY WITH UTR / TXN / ORDER ID (15-min window)
+# ============================================================
+
+class VerifyBody(BaseModel):
+    order_id: Optional[str] = None
+    utr: Optional[str] = None
+    transaction_id: Optional[str] = None
+    secret: Optional[str] = None
+    amount: Optional[float] = None     # optional — pass to enforce amount match
+
+
+@app.post("/api/pay/verify-utr")
+async def verify_utr(body: VerifyBody):
+    """
+    Verify a payment using order_id, utr, or transaction_id.
+
+    Rules:
+      - Verification only allowed within PAYMENT_EXPIRY_MINUTES (15 min)
+      - If order is EXPIRED / older than 15 min → info-only + expired flag
+      - Duplicate UTR / TXN rejected
+      - Amount can optionally be checked against the order
+      - Response always includes full payment details
+    """
+    if WEBHOOK_SECRET and body.secret != WEBHOOK_SECRET:
+        raise HTTPException(401, {"code": "INVALID_SECRET", "message": "Wrong secret"})
+
+    order_id = (body.order_id or "").strip()
+    utr = (body.utr or "").strip()
+    txn = (body.transaction_id or "").strip()
+
+    if not (order_id or utr or txn):
+        raise HTTPException(400, {"code": "MISSING_PARAM",
+                                  "message": "Provide order_id, utr, or transaction_id"})
+
+    if utr and len(utr) < 6:
+        raise HTTPException(400, {"code": "INVALID_UTR", "message": "UTR too short (min 6 chars)"})
+
+    # 1. Find the order
+    order = await _find_order_by_any(order_id, utr, txn)
+    if not order:
+        raise HTTPException(404, {"code": "ORDER_NOT_FOUND",
+                                  "message": "No order found for the provided identifier"})
+
+    # 2. Auto-expire if needed
+    if order["status"] == "PENDING":
+        exp = order["expires_at"]
+        if isinstance(exp, str):
+            try:
+                exp = datetime.fromisoformat(exp)
+            except Exception:
+                exp = None
+        if exp and now() > exp:
+            order = await _expire_order_if_needed(order["order_id"])
+            if not order:
+                order = await _find_order_by_any(order_id=order["order_id"]) if order else None
+
+    current_order_id = order["order_id"]
+    status = order["status"]
+
+    # 3. Already success → return details
+    if status == "SUCCESS":
+        return {
+            "success": True,
+            "verified": True,
+            "message": "Payment already verified",
+            "payment": order_to_dict(order),
+            "gateway": BRAND, "developer": DEVELOPER,
+        }
+
+    # 4. Expired / failed → info only
+    if status in ("EXPIRED", "FAILED"):
+        return {
+            "success": True,
+            "verified": False,
+            "expired": True,
+            "message": f"Order is {status} — verification window closed ({PAYMENT_EXPIRY_MINUTES} min). Info shown only.",
+            "payment": order_to_dict(order),
+            "gateway": BRAND, "developer": DEVELOPER,
+        }
+
+    # 5. Amount check (optional)
+    if body.amount is not None:
+        if abs(float(order["amount"]) - float(body.amount)) > 0.001:
+            return {
+                "success": False,
+                "verified": False,
+                "message": f"Amount mismatch: order is ₹{float(order['amount']):.2f}, submitted ₹{float(body.amount):.2f}",
+                "payment": order_to_dict(order),
+                "gateway": BRAND, "developer": DEVELOPER,
+            }
+
+    # 6. Attempt verification
+    final_txn = txn or order["transaction_id"] or f"MANUAL_{int(now().timestamp())}"
+    final_utr = utr or order["utr"]
+
+    ok, msg = await _mark_order_success(
+        order_id=current_order_id,
+        txn_id=final_txn,
+        source="UTR",
+        utr=final_utr,
+    )
+
+    # refresh
+    order = await _find_order_by_any(order_id=current_order_id)
+
+    if not ok:
+        return {
+            "success": False,
+            "verified": False,
+            "message": msg,
+            "payment": order_to_dict(order),
+            "gateway": BRAND, "developer": DEVELOPER,
+        }
+
     return {
         "success": True,
-        "order_id": order_id,
-        "amount": float(order["amount"]),
-        "currency": order["currency"],
-        "status": st,
-        "transaction_id": order["transaction_id"],
-        "upi_reference": order["upi_reference"],
-        "payer_name": order["payer_name"],
-        "verified_by": order["verified_by"],
-        "verified": True if st == "SUCCESS" else bool(order["verified"]),
-        "expires_at": order["expires_at"].isoformat(),
-        "expired": st == "EXPIRED",
-        "can_verify": st == "PENDING",
-        "gateway": BRAND,
-        "developer": DEVELOPER,
+        "verified": True,
+        "message": "Payment verified successfully",
+        "payment": order_to_dict(order),
+        "gateway": BRAND, "developer": DEVELOPER,
     }
 
 
 # ============================================================
-# 7. WEBHOOK
+# 7. VERIFY (GET) — paste-in-browser
+# ============================================================
+
+@app.get("/api/pay/verify")
+async def verify_get(
+    order_id: Optional[str] = Query(None),
+    utr: Optional[str] = Query(None),
+    transaction_id: Optional[str] = Query(None),
+    amount: Optional[float] = Query(None),
+    secret: Optional[str] = Query(None),
+):
+    return await verify_utr(VerifyBody(
+        order_id=order_id, utr=utr, transaction_id=transaction_id,
+        amount=amount, secret=secret,
+    ))
+
+
+# ============================================================
+# 8. WEBHOOK (PSP)
 # ============================================================
 
 class WebhookBody(BaseModel):
@@ -628,6 +758,7 @@ class WebhookBody(BaseModel):
     transaction_id: str
     amount: float
     status: str
+    utr: Optional[str] = None
     upi_reference: Optional[str] = None
     payer_name: Optional[str] = None
     secret: Optional[str] = None
@@ -643,10 +774,8 @@ async def provider_webhook(body: WebhookBody):
         order = await conn.fetchrow("SELECT * FROM orders WHERE order_id=$1", body.order_id)
         if not order:
             raise HTTPException(404, {"code": "ORDER_NOT_FOUND", "message": "Order not found"})
-
         if abs(float(order["amount"]) - float(body.amount)) > 0.001:
             raise HTTPException(400, {"code": "AMOUNT_MISMATCH", "message": "Amount mismatch"})
-
         if order["webhook_received"] == 1 and order["transaction_id"] == body.transaction_id:
             return {"success": True, "message": "Already processed"}
 
@@ -658,154 +787,33 @@ async def provider_webhook(body: WebhookBody):
             final, verified = "PENDING", 0
 
         await conn.execute(
-            """
-            UPDATE orders
-            SET status=$1, transaction_id=$2, upi_reference=$3, payer_name=$4,
-                verified_by='WEBHOOK',
-                webhook_received=1, verified=$5, updated_at=$6
-            WHERE order_id=$7
-            """,
-            final, body.transaction_id, body.upi_reference, body.payer_name,
-            verified, now(), body.order_id,
-        )
+            """UPDATE orders
+               SET status=$1, transaction_id=$2, utr=COALESCE($3,utr),
+                   upi_reference=$4, payer_name=$5, verified_by='WEBHOOK',
+                   webhook_received=1, verified=$6, updated_at=$7
+               WHERE order_id=$8""",
+            final, body.transaction_id, body.utr, body.upi_reference,
+            body.payer_name, verified, now(), body.order_id)
 
     if final == "SUCCESS":
         await _notify_telegram_admin(
-            order_id=body.order_id,
-            amount=float(order["amount"]),
-            transaction_id=body.transaction_id,
-            upi_reference=body.upi_reference,
-            payer=body.payer_name,
-            source="Webhook",
-        )
+            order_id=body.order_id, amount=float(order["amount"]),
+            transaction_id=body.transaction_id, payer=body.payer_name, source="Webhook")
 
-    return {
-        "success": True,
-        "message": "Webhook processed",
-        "order_id": body.order_id,
-        "status": final,
-        "gateway": BRAND,
-        "developer": DEVELOPER,
-    }
+    return {"success": True, "message": "Webhook processed",
+            "order_id": body.order_id, "status": final,
+            "gateway": BRAND, "developer": DEVELOPER}
 
 
 # ============================================================
-# 8. MANUAL UTR / TXN / ORDER VERIFY
-# ============================================================
-
-class UtrBody(BaseModel):
-    order_id: Optional[str] = None
-    utr: Optional[str] = None
-    transaction_id: Optional[str] = None
-    secret: Optional[str] = None
-
-
-@app.post("/api/pay/verify-utr")
-async def verify_utr(body: UtrBody):
-    if WEBHOOK_SECRET and body.secret != WEBHOOK_SECRET:
-        raise HTTPException(401, {"code": "INVALID_SECRET", "message": "Wrong secret"})
-
-    txn = (body.utr or body.transaction_id or "").strip()
-    order_id = (body.order_id or "").strip()
-
-    if not order_id and not txn:
-        raise HTTPException(
-            400,
-            {"code": "MISSING_PARAM",
-             "message": "Provide at least one of: order_id, utr, transaction_id"},
-        )
-
-    if txn and len(txn) < 6:
-        raise HTTPException(400, {"code": "INVALID_UTR", "message": "UTR too short (min 6 chars)"})
-
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        if txn:
-            existing = await conn.fetchrow(
-                "SELECT order_id FROM orders WHERE transaction_id=$1 AND status='SUCCESS'",
-                txn,
-            )
-            if existing and existing["order_id"] != order_id:
-                raise HTTPException(
-                    409,
-                    {"code": "UTR_ALREADY_USED",
-                     "message": f"UTR already used for order {existing['order_id']}"},
-                )
-
-        if not order_id:
-            raise HTTPException(404, {"code": "ORDER_NOT_FOUND",
-                                      "message": "order_id required for UTR verification"})
-
-        order = await conn.fetchrow("SELECT * FROM orders WHERE order_id=$1", order_id)
-        if not order:
-            raise HTTPException(404, {"code": "ORDER_NOT_FOUND", "message": "Order not found"})
-
-        if order["status"] == "SUCCESS":
-            return {
-                "success": True,
-                "message": "Order already SUCCESS",
-                "order_id": order["order_id"],
-                "transaction_id": order["transaction_id"],
-                "gateway": BRAND,
-                "developer": DEVELOPER,
-            }
-
-        if order["status"] in ("EXPIRED", "FAILED"):
-            raise HTTPException(
-                410,
-                {"code": "ORDER_EXPIRED",
-                 "message": f"Order is {order['status']} — cannot verify"},
-            )
-
-        if now() > order["expires_at"]:
-            await conn.execute(
-                "UPDATE orders SET status='EXPIRED', updated_at=$1 WHERE order_id=$2",
-                now(), order["order_id"],
-            )
-            await _notify_telegram_expiry(order["order_id"], float(order["amount"]))
-            raise HTTPException(
-                410,
-                {"code": "PAYMENT_EXPIRED",
-                 "message": f"Payment window expired ({PAYMENT_EXPIRY_MINUTES} min). Cannot verify this order."},
-            )
-
-        seconds_left = int((order["expires_at"] - now()).total_seconds())
-
-    final_txn = txn or order["transaction_id"] or f"MANUAL_{int(now().timestamp())}"
-
-    ok, msg = await _mark_order_success(
-        order_id=order["order_id"],
-        txn_id=final_txn,
-        source="UTR",
-    )
-    if not ok:
-        raise HTTPException(400, {"code": "FAILED", "message": msg})
-
-    return {
-        "success": True,
-        "message": "Order verified",
-        "order_id": order["order_id"],
-        "transaction_id": final_txn,
-        "amount": float(order["amount"]),
-        "verified_by": "UTR",
-        "seconds_remaining_at_verify": seconds_left,
-        "gateway": BRAND,
-        "developer": DEVELOPER,
-    }
-
-
-# ============================================================
-# 9. GMAIL AUTO-VERIFY
+# 9. GMAIL AUTO-VERIFY (amount detection)
 # ============================================================
 
 def _decode_email_header(raw):
     parts = decode_header(raw or "")
     out = ""
     for content, enc in parts:
-        if isinstance(content, bytes):
-            out += content.decode(enc or "utf-8", errors="ignore")
-        else:
-            out += content
+        out += content.decode(enc or "utf-8", errors="ignore") if isinstance(content, bytes) else content
     return out
 
 
@@ -846,20 +854,16 @@ async def _check_emails_once():
         M = imaplib.IMAP4_SSL("imap.gmail.com", 993)
         M.login(GMAIL_EMAIL, GMAIL_APP_PASSWORD)
         M.select("INBOX")
-
         typ, data = M.search(None, f'(UNSEEN FROM "{FAMAPP_SENDER}")')
         if typ != "OK" or not data or not data[0]:
             M.logout()
             return []
-
         results = []
-        ids = data[0].split()
-        for num in ids:
+        for num in data[0].split():
             typ, msg_data = M.fetch(num, "(RFC822)")
             if typ != "OK":
                 continue
-            raw = msg_data[0][1]
-            msg = email.message_from_bytes(raw)
+            msg = email.message_from_bytes(msg_data[0][1])
             subject = _decode_email_header(msg.get("Subject", ""))
             body = _extract_email_body(msg)
             full = f"{subject}\n{body}"
@@ -869,11 +873,11 @@ async def _check_emails_once():
                 continue
             amount = float(amt_match.group(1).replace(",", ""))
 
-            txn_match = re.search(
-                r"(?:Transaction\s*ID|Txn|UTR|Ref(?:erence)?)[\s:]+([A-Z0-9]+)",
-                full, re.I,
-            )
+            txn_match = re.search(r"(?:Transaction\s*ID|Txn|UTR|Ref(?:erence)?)[\s:]+([A-Z0-9]+)", full, re.I)
             txn_id = txn_match.group(1) if txn_match else f"EML_{int(now().timestamp())}"
+
+            utr_match = re.search(r"UTR[\s:]+([A-Z0-9]+)", full, re.I)
+            utr = utr_match.group(1) if utr_match else None
 
             ref_match = re.search(r"UPI[\s:]*([A-Z0-9]+)", full, re.I)
             upi_ref = ref_match.group(1) if ref_match else None
@@ -882,58 +886,45 @@ async def _check_emails_once():
             payer = from_match.group(1).strip() if from_match else None
 
             results.append({
-                "amount": amount,
-                "transaction_id": txn_id,
-                "upi_reference": upi_ref,
-                "payer": payer,
-                "email_uid": num.decode(),
+                "amount": amount, "transaction_id": txn_id, "utr": utr,
+                "upi_reference": upi_ref, "payer": payer, "email_uid": num.decode(),
             })
-
         for r in results:
             try:
                 M.store(r["email_uid"], "+FLAGS", "\\Seen")
             except Exception:
                 pass
-
         M.logout()
         return results
 
     emails = await asyncio.to_thread(_imap_work)
     if not emails:
         return
-
     pool = await get_pool()
     for em in emails:
         async with pool.acquire() as conn:
             exists = await conn.fetchrow(
-                "SELECT 1 FROM orders WHERE transaction_id=$1",
-                em["transaction_id"],
-            )
+                "SELECT 1 FROM orders WHERE transaction_id=$1 OR (utr IS NOT NULL AND utr=$2)",
+                em["transaction_id"], em["utr"])
             if exists:
                 continue
-
+            # Match by EXACT amount
             order = await conn.fetchrow(
                 """
                 SELECT * FROM orders
                 WHERE status='PENDING'
-                  AND amount=$1
+                  AND amount = $1
                   AND created_at > NOW() - INTERVAL '30 minutes'
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
-                em["amount"],
-            )
+                em["amount"])
             if not order:
                 logger.info("Email (₹%.2f) — no matching PENDING order", em["amount"])
                 continue
-
         await _mark_order_success(
-            order_id=order["order_id"],
-            txn_id=em["transaction_id"],
-            source="EMAIL",
-            upi_ref=em["upi_reference"],
-            payer=em["payer"],
-        )
+            order_id=order["order_id"], txn_id=em["transaction_id"],
+            source="EMAIL", utr=em["utr"], payer=em["payer"])
         logger.info("Auto-verified %s from email", order["order_id"])
 
 
@@ -943,7 +934,7 @@ async def email_test():
         return {"success": False, "error": "Gmail not configured"}
     try:
         await _check_emails_once()
-        return {"success": True, "message": "Scan complete — check logs"}
+        return {"success": True, "message": "Scan complete"}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -952,66 +943,35 @@ async def email_test():
 # 10. TELEGRAM NOTIFY
 # ============================================================
 
-async def _notify_telegram_admin(
-    order_id: str,
-    amount: float,
-    transaction_id: str = None,
-    upi_reference: str = None,
-    payer: str = None,
-    source: str = None,
-):
+async def _notify_telegram_admin(order_id, amount, transaction_id=None,
+                                 upi_reference=None, payer=None, source=None):
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_ID):
         return
-    text = (
-        "💰 *PAYMENT RECEIVED*\n\n"
-        f"🆔 Order: `{order_id}`\n"
-        f"💵 Amount: *₹{amount:.2f}*\n"
-    )
-    if payer:
-        text += f"👤 From: {payer}\n"
-    if transaction_id:
-        text += f"🧾 Txn: `{transaction_id}`\n"
-    if upi_reference:
-        text += f"📎 UPI Ref: `{upi_reference}`\n"
-    if source:
-        text += f"✅ Verified via: *{source}*\n"
+    text = f"💰 *PAYMENT RECEIVED*\n\n🆔 Order: `{order_id}`\n💵 Amount: *₹{amount:.2f}*\n"
+    if payer: text += f"👤 From: {payer}\n"
+    if transaction_id: text += f"🧾 Txn: `{transaction_id}`\n"
+    if upi_reference: text += f"📎 UPI Ref: `{upi_reference}`\n"
+    if source: text += f"✅ Verified via: *{source}*\n"
     text += f"\n— {BRAND} · {DEVELOPER}"
-
     try:
         async with httpx.AsyncClient(timeout=10) as tg:
             await tg.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={
-                    "chat_id": int(TELEGRAM_ADMIN_ID),
-                    "text": text,
-                    "parse_mode": "Markdown",
-                },
-            )
+                json={"chat_id": int(TELEGRAM_ADMIN_ID), "text": text, "parse_mode": "Markdown"})
     except Exception as e:
         logger.warning("Telegram notify failed: %s", e)
 
 
-async def _notify_telegram_expiry(order_id: str, amount: float):
+async def _notify_telegram_expiry(order_id, amount):
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_ID):
         return
-    text = (
-        "⌛ *PAYMENT EXPIRED*\n\n"
-        f"🆔 Order: `{order_id}`\n"
-        f"💵 Amount: *₹{amount:.2f}*\n"
-        f"⏱️ Window: {PAYMENT_EXPIRY_MINUTES} minutes\n"
-        "❌ No UTR submitted in time\n\n"
-        f"— {BRAND} · {DEVELOPER}"
-    )
+    text = (f"⌛ *PAYMENT EXPIRED*\n\n🆔 Order: `{order_id}`\n💵 Amount: *₹{amount:.2f}*\n"
+            f"⏱️ Window: {PAYMENT_EXPIRY_MINUTES} minutes\n❌ Verification window closed\n\n— {BRAND} · {DEVELOPER}")
     try:
         async with httpx.AsyncClient(timeout=10) as tg:
             await tg.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={
-                    "chat_id": int(TELEGRAM_ADMIN_ID),
-                    "text": text,
-                    "parse_mode": "Markdown",
-                },
-            )
+                json={"chat_id": int(TELEGRAM_ADMIN_ID), "text": text, "parse_mode": "Markdown"})
     except Exception as e:
         logger.warning("Telegram expiry notify failed: %s", e)
 
@@ -1027,19 +987,22 @@ async def payment_page(order_id: str):
         return HTMLResponse("<h2>Payment order not found</h2>", status_code=404)
 
     qr, upi_uri = generate_upi_qr(float(order["amount"]), order_id)
-
     status = order["status"]
     is_active = status == "PENDING"
     is_success = status == "SUCCESS"
     is_expired = status in ("EXPIRED", "FAILED")
 
-    if is_active:
-        secs = max(0, int((order["expires_at"] - now()).total_seconds()))
-    else:
-        secs = 0
+    expires_at = order["expires_at"]
+    if isinstance(expires_at, str):
+        try:
+            expires_at = datetime.fromisoformat(expires_at)
+        except Exception:
+            expires_at = None
 
-    created_str = order["created_at"].strftime("%d %b %Y, %I:%M %p UTC")
-    expires_str = order["expires_at"].strftime("%d %b %Y, %I:%M %p UTC")
+    secs = max(0, int((expires_at - now()).total_seconds())) if (is_active and expires_at) else 0
+
+    created_str = order["created_at"].strftime("%d %b %Y, %I:%M %p UTC") if hasattr(order["created_at"], "strftime") else str(order["created_at"])
+    expires_str = expires_at.strftime("%d %b %Y, %I:%M %p UTC") if expires_at else "—"
 
     if is_success:
         top_block = f"""
@@ -1047,7 +1010,7 @@ async def payment_page(order_id: str):
           <div class="result-icon">✅</div>
           <div class="result-title">Payment Successful</div>
           <div class="result-amount">₹{float(order["amount"]):.2f}</div>
-          <div class="result-sub">Thank you! Your payment has been verified.</div>
+          <div class="result-sub">Verified via {order["verified_by"] or "—"}</div>
         </div>
         """
     elif is_expired:
@@ -1056,7 +1019,7 @@ async def payment_page(order_id: str):
           <div class="result-icon">⌛</div>
           <div class="result-title">Payment Expired</div>
           <div class="result-amount">₹{float(order["amount"]):.2f}</div>
-          <div class="result-sub">Payment window closed ({PAYMENT_EXPIRY_MINUTES} minutes). Please create a new order.</div>
+          <div class="result-sub">Verification window ({PAYMENT_EXPIRY_MINUTES} min) closed. Details shown below.</div>
         </div>
         """
     else:
@@ -1067,7 +1030,7 @@ async def payment_page(order_id: str):
           <div class="timer">⏱️ Time remaining: <b id="timer">{secs}</b>s</div>
 
           <div class="box">
-            <h4>✍️ Already paid? Enter your UTR</h4>
+            <h4>✍️ Already paid? Enter your UTR / TXN</h4>
             <input id="utrInput" type="text" placeholder="UTR / Transaction ID" autocomplete="off">
             <button onclick="submitUTR()">Verify Payment</button>
             <small>UTR is the 12-digit number shown in your UPI app after payment.</small>
@@ -1090,8 +1053,7 @@ box-shadow:0 20px 60px rgba(0,0,0,.6);border:1px solid #1f2937}}
 .brand{{font-size:12px;letter-spacing:2px;color:#64748b;margin-bottom:4px;text-align:center}}
 .brand b{{color:#a855f7}}
 h2{{margin:6px 0 18px;text-align:center;font-size:22px}}
-.details{{background:#0b1220;border:1px solid #1f2937;border-radius:12px;
-padding:16px;margin-bottom:18px;font-size:13px}}
+.details{{background:#0b1220;border:1px solid #1f2937;border-radius:12px;padding:16px;margin-bottom:18px;font-size:13px}}
 .row{{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #1f2937}}
 .row:last-child{{border-bottom:none}}
 .row .k{{color:#94a3b8}}
@@ -1142,7 +1104,7 @@ background:#a855f7;color:#fff;font-weight:700;cursor:pointer;font-size:14px}}
     <div class="row"><span class="k">Created</span><span class="v">{created_str}</span></div>
     <div class="row"><span class="k">Expires</span><span class="v">{expires_str}</span></div>
     {f'<div class="row"><span class="k">Transaction ID</span><span class="v">{order["transaction_id"]}</span></div>' if order["transaction_id"] else ''}
-    {f'<div class="row"><span class="k">UPI Ref</span><span class="v">{order["upi_reference"]}</span></div>' if order["upi_reference"] else ''}
+    {f'<div class="row"><span class="k">UTR</span><span class="v">{order["utr"]}</span></div>' if order["utr"] else ''}
     {f'<div class="row"><span class="k">Payer</span><span class="v">{order["payer_name"]}</span></div>' if order["payer_name"] else ''}
     {f'<div class="row"><span class="k">Verified Via</span><span class="v">{order["verified_by"]}</span></div>' if order["verified_by"] else ''}
   </div>
@@ -1198,12 +1160,11 @@ async function submitUTR() {{
       body: JSON.stringify({{ order_id: ORDER_ID, utr: utr, secret: "change_me_random_secret" }})
     }});
     const d = await r.json();
-    if (r.ok && d.success) {{
+    if (d.success && d.verified) {{
       msg.innerHTML = '<span style="color:#10b981">✅ Verified! Refreshing...</span>';
       setTimeout(() => location.reload(), 1200);
     }} else {{
-      const reason = (d.detail && d.detail.message) || d.message || "Verification failed";
-      msg.innerHTML = '<span style="color:#ef4444">❌ ' + reason + '</span>';
+      msg.innerHTML = '<span style="color:#ef4444">❌ ' + (d.message || "Verification failed") + '</span>';
     }}
   }} catch(e) {{
     msg.innerHTML = '<span style="color:#ef4444">❌ Network error</span>';
