@@ -4,6 +4,7 @@ import hashlib
 import secrets
 import json
 import logging
+import socket
 import urllib.parse
 from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
@@ -31,34 +32,42 @@ logger = logging.getLogger("OS-GATEWAY")
 
 
 # ============================================================
-# ⚙️ HARDCODED CONFIG — EDIT THIS BLOCK ONLY
+# ⚙️ HARDCODED CONFIG — EDIT ONLY THIS BLOCK
 # ============================================================
 
-# 🔴 PASTE YOUR FREE POSTGRES URL HERE (from neon.tech)
+# 🔴 PASTE YOUR NEON POSTGRES URL HERE
 DATABASE_URL = "postgresql://user:password@host:5432/dbname?sslmode=require"
 
-# Merchant info (yours)
 MERCHANT_NAME   = "HAMZA KHAN"
 MERCHANT_UPI_ID = "khannhamzaa@fam"
 
-# Admin key (to create merchant API keys)
-ADMIN_KEY = "os-gateway@123"
-
-# Webhook shared secret (optional — used inside webhook body)
+ADMIN_KEY      = "os-gateway@123"
 WEBHOOK_SECRET = "change_me_random_secret"
 
-# Limits
 MAX_PAYMENT_AMOUNT     = 100000.0
 PAYMENT_EXPIRY_MINUTES = 15
 
-# CORS
 ALLOWED_ORIGINS = ["*"]
 
-DB_SSL = "require"
+# ============================================================
+# END CONFIG
+# ============================================================
+
 
 # ============================================================
-# END OF CONFIG
+# 🛠️ DNS FIX FOR VERCEL
+# Force IPv4 + patch socket.getaddrinfo so asyncpg works
+# inside the serverless runtime.
 # ============================================================
+
+_original_getaddrinfo = socket.getaddrinfo
+
+
+def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return _original_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+
+socket.getaddrinfo = _ipv4_getaddrinfo
 
 
 # ============================================================
@@ -71,10 +80,19 @@ _pool: Optional[asyncpg.Pool] = None
 async def get_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
+        # asyncpg needs the ssl kwarg stripped from the URL string
+        dsn = DATABASE_URL
+        ssl_mode = "require"
+        if "sslmode=" in dsn:
+            # asyncpg doesn't understand ?sslmode= in the DSN
+            base, _, _q = dsn.partition("?")
+            dsn = base
+
         _pool = await asyncpg.create_pool(
-            DATABASE_URL,
-            min_size=1, max_size=5,
-            ssl=False if DB_SSL == "disable" else DB_SSL,
+            dsn=dsn,
+            min_size=1,
+            max_size=3,
+            ssl=ssl_mode,
             command_timeout=20,
         )
     return _pool
@@ -209,7 +227,22 @@ async def health():
 
 
 # ============================================================
-# 2. CREATE MERCHANT (admin, direct URL)
+# 1b. DB TEST — confirms Postgres is reachable
+# ============================================================
+
+@app.get("/api/db-test")
+async def db_test():
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            val = await conn.fetchval("SELECT 1")
+        return {"success": True, "db": "connected", "value": val}
+    except Exception as e:
+        return {"success": False, "db": "error", "message": str(e)}
+
+
+# ============================================================
+# 2. CREATE MERCHANT
 # ============================================================
 
 @app.get("/api/admin/create-merchant")
@@ -241,7 +274,6 @@ async def create_merchant(
         "name": name,
         "gateway": "OS GATEWAY",
         "developer": "@MODX",
-        "note": "Save this API key — shown only once.",
     }
 
 
@@ -549,10 +581,13 @@ setInterval(check,4000);
 
 
 # ============================================================
-# ERROR HANDLER
+# ✅ FIXED ERROR HANDLER (this was crashing before)
 # ============================================================
 
 @app.exception_handler(Exception)
 async def err_handler(request: Request, exc: Exception):
-    logger.exception("err")
-    return JSONResponse(500, {"success": False, "error": {"code": "INTERNAL_ERROR"}})
+    logger.exception("Unhandled error: %s", exc)
+    return JSONResponse(
+        content={"success": False, "error": {"code": "INTERNAL_ERROR", "message": str(exc)}},
+        status_code=500,
+    )
