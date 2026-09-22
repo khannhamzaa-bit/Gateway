@@ -35,8 +35,8 @@ logger = logging.getLogger("OS-GATEWAY")
 # ⚙️ HARDCODED CONFIG — EDIT ONLY THIS BLOCK
 # ============================================================
 
-# 🔴 PASTE YOUR NEON POSTGRES URL HERE
-DATABASE_URL = "postgresql://user:password@host:5432/dbname?sslmode=require"
+# 🔴 REPLACE npg_USgbsX5pDRO4 WITH YOUR NEW NEON PASSWORD
+DATABASE_URL = "postgresql://neondb_owner:npg_USgbsX5pDRO4@ep-bold-art-avpvzvhx-pooler.c-11.us-east-1.aws.neon.tech/neondb"
 
 MERCHANT_NAME   = "HAMZA KHAN"
 MERCHANT_UPI_ID = "khannhamzaa@fam"
@@ -55,9 +55,7 @@ ALLOWED_ORIGINS = ["*"]
 
 
 # ============================================================
-# 🛠️ DNS FIX FOR VERCEL
-# Force IPv4 + patch socket.getaddrinfo so asyncpg works
-# inside the serverless runtime.
+# 🛠️ DNS FIX FOR VERCEL (forces IPv4 lookups)
 # ============================================================
 
 _original_getaddrinfo = socket.getaddrinfo
@@ -80,19 +78,14 @@ _pool: Optional[asyncpg.Pool] = None
 async def get_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
-        # asyncpg needs the ssl kwarg stripped from the URL string
-        dsn = DATABASE_URL
-        ssl_mode = "require"
-        if "sslmode=" in dsn:
-            # asyncpg doesn't understand ?sslmode= in the DSN
-            base, _, _q = dsn.partition("?")
-            dsn = base
+        # Strip ALL query params — asyncpg doesn't parse libpq options
+        dsn = DATABASE_URL.split("?")[0]
 
         _pool = await asyncpg.create_pool(
             dsn=dsn,
             min_size=1,
             max_size=3,
-            ssl=ssl_mode,
+            ssl="require",
             command_timeout=20,
         )
     return _pool
@@ -227,7 +220,7 @@ async def health():
 
 
 # ============================================================
-# 1b. DB TEST — confirms Postgres is reachable
+# 1b. DB TEST
 # ============================================================
 
 @app.get("/api/db-test")
@@ -581,7 +574,7 @@ setInterval(check,4000);
 
 
 # ============================================================
-# ✅ FIXED ERROR HANDLER (this was crashing before)
+# ERROR HANDLER
 # ============================================================
 
 @app.exception_handler(Exception)
