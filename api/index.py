@@ -1,6 +1,6 @@
 # ============================================================
-# FAMAPP PAYMENT GATEWAY — VERCEL EDITION (v5)
-# Purpose = Order ID (single field)
+# FAMAPP PAYMENT GATEWAY — VERCEL EDITION
+# Order ID verification + Full payment info
 # ============================================================
 
 import os
@@ -9,7 +9,6 @@ import io
 import time
 import uuid
 import json
-import base64
 import hashlib
 import imaplib
 import email
@@ -50,53 +49,26 @@ UPI_NAME = os.environ.get("UPI_NAME", "Hamza")
 
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "admin@key")
 
-SECRET = os.environ.get(
-    "SECRET",
-    hashlib.sha256((ADMIN_KEY + "famapp-salt").encode()).hexdigest()
-)
-
 DATABASE = "/tmp/payments.db"
-
-HOST = "0.0.0.0"
-PORT = int(os.environ.get("PORT", 8080))
 
 SCAN_INTERVAL = 20
 EMAIL_DAYS = 7
 PAYMENT_EXPIRY_MINUTES = 15
-
-
-# ============================================================
-# VERIFICATION CONFIG
-# ============================================================
-
-VERIFY_API_URL = os.environ.get("VERIFY_API_URL", "")
-VERIFY_API_KEY = os.environ.get("VERIFY_API_KEY", "")
 
 UTR_MIN_LENGTH = 12
 UTR_MAX_LENGTH = 22
 TXN_MIN_LENGTH = 6
 TXN_MAX_LENGTH = 64
 
-STRICT_UTR_FORMAT = True
-STRICT_TXN_FORMAT = True
-
-
-# ============================================================
-# PROTECTION
-# ============================================================
-
-MAX_SCAN_ATTEMPTS = 60
-RATE_WINDOW = 3600
 MIN_SCAN_INTERVAL = 10
 
-_rate_store = {}
+
+# ============================================================
+# STATE
+# ============================================================
+
 _scan_lock = threading.Lock()
 _last_scan_time = 0
-
-
-# ============================================================
-# QR CACHE
-# ============================================================
 
 _qr_cache = {}
 _qr_cache_lock = threading.Lock()
@@ -116,44 +88,6 @@ def log(msg):
 
 
 # ============================================================
-# HELPERS
-# ============================================================
-
-def get_client_ip():
-    fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.remote_addr or "unknown"
-
-
-def rate_limit(bucket, ip, max_calls, window=RATE_WINDOW):
-    now = time.time()
-    key = f"{bucket}:{ip}"
-    with _scan_lock:
-        entries = _rate_store.get(key, [])
-        entries = [t for t in entries if now - t < window]
-        if len(entries) >= max_calls:
-            _rate_store[key] = entries
-            return False, 0
-        entries.append(now)
-        _rate_store[key] = entries
-        return True, max_calls - len(entries)
-
-
-def cleanup_rate_store():
-    now = time.time()
-    with _scan_lock:
-        for key in list(_rate_store.keys()):
-            entries = [
-                t for t in _rate_store[key] if now - t < RATE_WINDOW
-            ]
-            if entries:
-                _rate_store[key] = entries
-            else:
-                _rate_store.pop(key, None)
-
-
-# ============================================================
 # DATABASE
 # ============================================================
 
@@ -168,9 +102,7 @@ def get_db():
 def setup_database():
     conn = get_db()
 
-    # --------------------------------------------------------
-    # orders — order_id == purpose (single field)
-    # --------------------------------------------------------
+    # Orders
     conn.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -188,9 +120,7 @@ def setup_database():
         )
     """)
 
-    # --------------------------------------------------------
-    # payments — verified transactions
-    # --------------------------------------------------------
+    # Payments
     conn.execute("""
         CREATE TABLE IF NOT EXISTS payments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -202,7 +132,6 @@ def setup_database():
             gmail_uid TEXT UNIQUE,
             payment_date TEXT,
             order_id TEXT,
-            verification_source TEXT,
             created_at TEXT NOT NULL,
             verified_at TEXT,
             note TEXT DEFAULT ''
@@ -219,9 +148,7 @@ def setup_database():
         WHERE transaction_id IS NOT NULL AND transaction_id != ''
     """)
 
-    # --------------------------------------------------------
-    # verification log
-    # --------------------------------------------------------
+    # Verification logs
     conn.execute("""
         CREATE TABLE IF NOT EXISTS verification_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -231,22 +158,8 @@ def setup_database():
             transaction_id TEXT,
             sender_name TEXT,
             gmail_uid TEXT,
-            ip TEXT,
             result TEXT,
             reason TEXT,
-            created_at TEXT
-        )
-    """)
-
-    # --------------------------------------------------------
-    # security events
-    # --------------------------------------------------------
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS security_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ip TEXT,
-            event TEXT,
-            detail TEXT,
             created_at TEXT
         )
     """)
@@ -255,57 +168,22 @@ def setup_database():
     conn.close()
 
 
-def security_log(event, detail=""):
-    try:
-        ip = get_client_ip()
-    except Exception:
-        ip = "unknown"
-    log(f"SECURITY | {event} | IP={ip} | {detail}")
-    try:
-        conn = get_db()
-        conn.execute(
-            """
-            INSERT INTO security_events (ip, event, detail, created_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (ip, event, detail,
-             datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-        )
-        conn.commit()
-        conn.close()
-    except Exception:
-        pass
-
-
 # ============================================================
-# ORDER ID (= Purpose)
+# ORDER ID
 # ============================================================
 
 def generate_order_id(hint=""):
-    """
-    Generate the order ID. This IS the purpose.
-
-    If hint is provided (e.g. "TG123456789"),
-    the order_id becomes:  TG123456789-ORD260922ABCD
-
-    Otherwise:             ORD260922ABCD
-    """
     base = (
         "ORD"
         + datetime.now().strftime("%y%m%d%H%M%S")
         + uuid.uuid4().hex[:4].upper()
     )
-    hint = (hint or "").strip()[:20]
-    if hint:
-        # Sanitize hint to be UPI-note-safe
-        hint = re.sub(r"[^A-Za-z0-9]", "", hint)
-        if hint:
-            return f"{hint}-{base}"
-    return base
+    hint = re.sub(r"[^A-Za-z0-9]", "", (hint or "").strip())[:20]
+    return f"{hint}-{base}" if hint else base
 
 
 # ============================================================
-# UPI LINK
+# UPI / QR
 # ============================================================
 
 def make_upi_link(amount, order_id):
@@ -319,31 +197,25 @@ def make_upi_link(amount, order_id):
     )
 
 
-# ============================================================
-# FAST QR
-# ============================================================
-
-def _make_qr_key(data):
-    return hashlib.md5(data.encode()).hexdigest()
-
-
 def get_qr_bytes(data):
-    key = _make_qr_key(data)
+    key = hashlib.md5(data.encode()).hexdigest()
+
     with _qr_cache_lock:
         if key in _qr_cache:
             return _qr_cache[key]
 
     qr = qrcode.QRCode(
-        version=None,
         error_correction=qrcode.constants.ERROR_CORRECT_L,
         box_size=8,
         border=2,
     )
     qr.add_data(data)
     qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
+    img = qr.make_image(
+        fill_color="black", back_color="white"
+    )
     buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=False)
+    img.save(buf, format="PNG")
     data_bytes = buf.getvalue()
 
     with _qr_cache_lock:
@@ -360,33 +232,31 @@ def get_qr_bytes(data):
 
 def connect_gmail():
     if not GMAIL_APP_PASSWORD:
-        log("GMAIL | LOGIN=FAILED | password missing")
         return None
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
         mail.login(GMAIL_EMAIL, GMAIL_APP_PASSWORD)
-        log("GMAIL | LOGIN=SUCCESS")
         return mail
     except Exception as e:
-        log(f"GMAIL | LOGIN=FAILED | {e}")
+        log(f"GMAIL | LOGIN_FAILED | {e}")
         return None
 
 
 def decode_text(value):
     if not value:
         return ""
-    result = []
+    out = []
     try:
         for part, enc in decode_header(value):
             if isinstance(part, bytes):
-                result.append(
+                out.append(
                     part.decode(enc or "utf-8", errors="ignore")
                 )
             else:
-                result.append(str(part))
+                out.append(str(part))
     except Exception:
         return str(value)
-    return "".join(result)
+    return "".join(out)
 
 
 def get_email_body(message):
@@ -417,31 +287,20 @@ def get_email_body(message):
                 )
         except Exception:
             text = str(message.get_payload())
+
     text = re.sub(r"<[^>]*>", " ", text)
     text = text.replace("&nbsp;", " ").replace("&amp;", "&")
     return re.sub(r"\s+", " ", text).strip()
 
 
 def parse_famapp_email(raw_email, gmail_uid):
-    """
-    Parse FamApp email.
-
-    Sample:
-        Transaction ID : FMPIB6649064781
-        Date : 02:37 PM IST, 22 September 2026
-        Updated Balance : ₹586.88
-        UTR : 841140558066
-        Purpose : TG8896221941-ORD260922ABCD
-    """
     try:
         message = email.message_from_bytes(raw_email)
-    except Exception as e:
-        log(f"EMAIL | PARSE_ERROR | {e}")
+    except Exception:
         return None
 
     subject = decode_text(message.get("Subject", ""))
     body = get_email_body(message)
-    sender = message.get("From", "")
     text = subject + " " + body
     lower = text.lower()
 
@@ -450,7 +309,6 @@ def parse_famapp_email(raw_email, gmail_uid):
     if "successfully received" not in lower:
         return None
 
-    # Amount
     am = re.search(r"₹\s*([0-9,]+(?:\.[0-9]+)?)", text)
     if not am:
         return None
@@ -459,7 +317,6 @@ def parse_famapp_email(raw_email, gmail_uid):
     except Exception:
         return None
 
-    # Sender
     sender_name = ""
     sm = re.search(
         r"successfully\s+received"
@@ -471,7 +328,6 @@ def parse_famapp_email(raw_email, gmail_uid):
     if sm:
         sender_name = sm.group(1).strip()
 
-    # Transaction ID
     txn = ""
     tm = re.search(
         r"Transaction\s*ID\s*:\s*([A-Za-z0-9_-]+)",
@@ -480,7 +336,6 @@ def parse_famapp_email(raw_email, gmail_uid):
     if tm:
         txn = tm.group(1).strip()
 
-    # UTR
     utr = ""
     um = re.search(
         r"UTR\s*:\s*([A-Za-z0-9_-]+)",
@@ -489,7 +344,6 @@ def parse_famapp_email(raw_email, gmail_uid):
     if um:
         utr = um.group(1).strip()
 
-    # Purpose (= order_id)
     order_id = ""
     pm = re.search(
         r"Purpose\s*:\s*([A-Za-z0-9_\-]+)",
@@ -498,7 +352,6 @@ def parse_famapp_email(raw_email, gmail_uid):
     if pm:
         order_id = pm.group(1).strip()
 
-    # Date
     payment_date = ""
     dm = re.search(
         r"Date\s*:\s*(.*?)"
@@ -510,7 +363,6 @@ def parse_famapp_email(raw_email, gmail_uid):
 
     return {
         "gmail_uid": str(gmail_uid),
-        "sender": sender,
         "sender_name": sender_name,
         "amount": amount,
         "transaction_id": txn,
@@ -521,7 +373,7 @@ def parse_famapp_email(raw_email, gmail_uid):
 
 
 # ============================================================
-# DATE PARSER
+# DATE PARSING
 # ============================================================
 
 DATE_FORMATS = (
@@ -558,11 +410,26 @@ def now_ist():
     return datetime.utcnow() + timedelta(hours=5, minutes=30)
 
 
+def human_age(seconds):
+    if seconds is None:
+        return "unknown"
+    seconds = int(seconds)
+    if seconds < 0:
+        return "just now"
+    if seconds < 60:
+        return f"{seconds} seconds"
+    if seconds < 3600:
+        return f"{seconds // 60} minutes"
+    if seconds < 86400:
+        return f"{seconds // 3600} hours"
+    return f"{seconds // 86400} days"
+
+
 # ============================================================
 # VALIDATION
 # ============================================================
 
-def validate_utr_format(utr):
+def validate_utr(utr):
     if not utr:
         return False, "UTR_MISSING"
     utr = utr.strip().upper()
@@ -572,44 +439,39 @@ def validate_utr_format(utr):
         return False, f"UTR_INVALID_LENGTH ({len(utr)})"
     if len(utr) == 12 and utr.isdigit():
         return True, "UTR_VALID_UPI"
-    if len(utr) == 22:
-        if re.fullmatch(r"[A-Z]{4}[A-Z0-9]{18}", utr):
-            return True, "UTR_VALID_IMPS_NEFT"
-        return False, "UTR_INVALID_IMPS_FORMAT"
+    if len(utr) == 22 and re.fullmatch(
+        r"[A-Z]{4}[A-Z0-9]{18}", utr
+    ):
+        return True, "UTR_VALID_IMPS"
     if 12 <= len(utr) <= 22:
-        return True, "UTR_VALID_GENERIC"
-    return False, "UTR_INVALID_FORMAT"
+        return True, "UTR_VALID"
+    return False, "UTR_INVALID"
 
 
-def validate_transaction_id(txn_id):
-    if not txn_id:
-        return False, "TXN_ID_MISSING"
-    txn_id = txn_id.strip().upper()
-    if not (TXN_MIN_LENGTH <= len(txn_id) <= TXN_MAX_LENGTH):
-        return False, f"TXN_ID_INVALID_LENGTH ({len(txn_id)})"
-    if not re.fullmatch(r"[A-Z0-9_-]+", txn_id):
-        return False, "TXN_ID_INVALID_CHARS"
-    return True, "TXN_ID_VALID"
+def validate_txn(txn):
+    if not txn:
+        return False, "TXN_MISSING"
+    txn = txn.strip().upper()
+    if not (TXN_MIN_LENGTH <= len(txn) <= TXN_MAX_LENGTH):
+        return False, f"TXN_INVALID_LENGTH ({len(txn)})"
+    if not re.fullmatch(r"[A-Z0-9_-]+", txn):
+        return False, "TXN_INVALID_CHARS"
+    return True, "TXN_VALID"
 
 
 # ============================================================
-# AUDIT LOG
+# LOG
 # ============================================================
 
-def log_verification(payment, order_id, result, reason, ip=None):
-    if ip is None:
-        try:
-            ip = get_client_ip()
-        except Exception:
-            ip = "system"
+def log_verification(payment, order_id, result, reason):
     conn = get_db()
     try:
         conn.execute(
             """
             INSERT INTO verification_logs (
                 order_id, amount, utr, transaction_id,
-                sender_name, gmail_uid, ip, result, reason, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                sender_name, gmail_uid, result, reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 order_id,
@@ -618,7 +480,6 @@ def log_verification(payment, order_id, result, reason, ip=None):
                 payment.get("transaction_id"),
                 payment.get("sender_name"),
                 payment.get("gmail_uid"),
-                ip,
                 result,
                 reason,
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -632,44 +493,7 @@ def log_verification(payment, order_id, result, reason, ip=None):
 
 
 # ============================================================
-# OFFICIAL API (optional)
-# ============================================================
-
-def verify_with_official_api(payment):
-    if not VERIFY_API_URL:
-        return {"checked": False, "verified": False,
-                "status": "API_NOT_CONFIGURED"}
-    payload = {
-        "utr": payment["utr"],
-        "transaction_id": payment["transaction_id"],
-        "amount": payment["amount"],
-        "upi_id": UPI_ID,
-    }
-    headers = {"Content-Type": "application/json"}
-    if VERIFY_API_KEY:
-        headers["Authorization"] = "Bearer " + VERIFY_API_KEY
-    try:
-        r = requests.post(
-            VERIFY_API_URL, json=payload, headers=headers, timeout=15
-        )
-        if r.status_code != 200:
-            return {"checked": True, "verified": False,
-                    "status": "API_HTTP_ERROR"}
-        data = r.json()
-        return {
-            "checked": True,
-            "verified": bool(data.get("verified", False)),
-            "status": str(data.get("status", "UNKNOWN")),
-            "data": data,
-        }
-    except Exception as e:
-        log(f"VERIFY_API | ERROR={e}")
-        return {"checked": True, "verified": False,
-                "status": "API_ERROR"}
-
-
-# ============================================================
-# ORDER LOOKUP
+# ORDER HELPERS
 # ============================================================
 
 def get_order_by_id(order_id):
@@ -682,13 +506,19 @@ def get_order_by_id(order_id):
     return row
 
 
-# ============================================================
-# CREATE ORDER
-# ============================================================
+def get_payment_by_order(order_id):
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM payments WHERE order_id=? "
+        "ORDER BY id DESC LIMIT 1",
+        (order_id,),
+    ).fetchone()
+    conn.close()
+    return row
+
 
 def create_order(amount, hint=""):
     order_id = generate_order_id(hint)
-
     now = datetime.now()
     expires = now + timedelta(minutes=PAYMENT_EXPIRY_MINUTES)
 
@@ -696,8 +526,7 @@ def create_order(amount, hint=""):
     conn.execute(
         """
         INSERT INTO orders (
-            order_id, amount, status,
-            created_at, expires_at
+            order_id, amount, status, created_at, expires_at
         ) VALUES (?, ?, 'PENDING', ?, ?)
         """,
         (
@@ -738,8 +567,8 @@ def save_unmatched(payment):
             INSERT INTO payments (
                 amount, status, sender_name, transaction_id, utr,
                 gmail_uid, payment_date, order_id,
-                verification_source, created_at, note
-            ) VALUES (?, 'UNMATCHED', ?, ?, ?, ?, ?, ?, 'GMAIL', ?, ?)
+                created_at, note
+            ) VALUES (?, 'UNMATCHED', ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payment["amount"],
@@ -765,31 +594,27 @@ def save_unmatched(payment):
 # ============================================================
 
 def verify_payment(payment):
-    """
-    Match incoming FamApp email to an order via the
-    Purpose field (= order_id).
-    """
 
-    # ---- Mandatory ----
+    # Mandatory fields
     if not payment.get("utr"):
         log_verification(payment, None, "REJECTED", "UTR_MISSING")
         return False
     if not payment.get("transaction_id"):
-        log_verification(payment, None, "REJECTED", "TXN_ID_MISSING")
+        log_verification(payment, None, "REJECTED", "TXN_MISSING")
         return False
 
-    # ---- Format ----
-    ok, reason = validate_utr_format(payment["utr"])
+    # Format checks
+    ok, reason = validate_utr(payment["utr"])
     if not ok:
         log_verification(payment, None, "REJECTED", reason)
         return False
 
-    ok, reason = validate_transaction_id(payment["transaction_id"])
+    ok, reason = validate_txn(payment["transaction_id"])
     if not ok:
         log_verification(payment, None, "REJECTED", reason)
         return False
 
-    # ---- Duplicates ----
+    # Duplicate checks
     conn = get_db()
     dup = conn.execute(
         "SELECT id FROM payments WHERE utr=? LIMIT 1",
@@ -797,7 +622,7 @@ def verify_payment(payment):
     ).fetchone()
     if dup:
         conn.close()
-        log_verification(payment, None, "DUPLICATE", "UTR_ALREADY_USED")
+        log_verification(payment, None, "DUPLICATE", "UTR_USED")
         return False
 
     dup = conn.execute(
@@ -806,7 +631,7 @@ def verify_payment(payment):
     ).fetchone()
     if dup:
         conn.close()
-        log_verification(payment, None, "DUPLICATE", "TXN_ALREADY_USED")
+        log_verification(payment, None, "DUPLICATE", "TXN_USED")
         return False
 
     dup = conn.execute(
@@ -815,43 +640,32 @@ def verify_payment(payment):
     ).fetchone()
     conn.close()
     if dup:
-        log_verification(payment, None, "DUPLICATE", "GMAIL_UID_SEEN")
+        log_verification(payment, None, "DUPLICATE", "GMAIL_SEEN")
         return False
 
-    # ---- Match order by order_id (= purpose) ----
+    # Match by order_id (= Purpose)
     order_id = payment.get("order_id", "")
     order = get_order_by_id(order_id)
 
     if not order:
-        log(
-            "PAYMENT | STATUS=NO_MATCHING_ORDER | "
-            f"ORDER_ID={order_id or '-'} | UTR={payment['utr']}"
-        )
-        log_verification(
-            payment, None, "UNMATCHED", "NO_MATCHING_ORDER"
-        )
+        log(f"PAYMENT | NO_ORDER | order_id={order_id or '-'}")
+        log_verification(payment, None, "UNMATCHED", "NO_ORDER")
         save_unmatched(payment)
         return False
 
-    # ---- Order status ----
+    # Order status
     if order["status"] == "VERIFIED":
         log_verification(
-            payment, order["order_id"], "DUPLICATE",
-            "ORDER_ALREADY_PAID",
+            payment, order_id, "DUPLICATE", "ORDER_PAID"
         )
         return False
-    if order["status"] == "CANCELLED":
+    if order["status"] in ("CANCELLED", "EXPIRED"):
         log_verification(
-            payment, order["order_id"], "REJECTED", "ORDER_CANCELLED"
-        )
-        return False
-    if order["status"] == "EXPIRED":
-        log_verification(
-            payment, order["order_id"], "REJECTED", "ORDER_EXPIRED"
+            payment, order_id, "REJECTED", f"ORDER_{order['status']}"
         )
         return False
 
-    # ---- Order expiry (created_at + 15 min) ----
+    # Order expiry
     try:
         created = datetime.strptime(
             order["created_at"], "%Y-%m-%d %H:%M:%S"
@@ -867,64 +681,46 @@ def verify_payment(payment):
             conn.commit()
             conn.close()
             log_verification(
-                payment, order["order_id"], "REJECTED",
-                "ORDER_EXPIRED",
+                payment, order_id, "REJECTED", "ORDER_EXPIRED"
             )
             return False
     except Exception:
         pass
 
-    # ---- 15-min payment age ----
+    # Payment age check (email must be < 15 min old)
     pay_dt = parse_payment_date(payment.get("payment_date", ""))
     if pay_dt:
         age = now_ist() - pay_dt
         if age > timedelta(minutes=PAYMENT_EXPIRY_MINUTES):
             log_verification(
-                payment, order["order_id"], "REJECTED",
-                f"PAYMENT_TOO_OLD ({int(age.total_seconds()//60)}m)",
+                payment, order_id, "REJECTED",
+                f"PAYMENT_OLD ({int(age.total_seconds()//60)}m)",
             )
             return False
     else:
         log_verification(
-            payment, order["order_id"], "REJECTED",
-            "PAYMENT_DATE_UNPARSEABLE",
+            payment, order_id, "REJECTED", "DATE_UNPARSEABLE"
         )
         return False
 
-    # ---- Amount ----
+    # Amount match
     try:
         pay_amt = round(float(payment["amount"]), 2)
         ord_amt = round(float(order["amount"]), 2)
     except Exception:
         log_verification(
-            payment, order["order_id"], "REJECTED",
-            "AMOUNT_PARSE_ERROR",
+            payment, order_id, "REJECTED", "AMOUNT_PARSE_ERR"
         )
         return False
 
     if pay_amt != ord_amt:
         log_verification(
-            payment, order["order_id"], "REJECTED",
-            f"AMOUNT_MISMATCH (paid={pay_amt}, order={ord_amt})",
+            payment, order_id, "REJECTED",
+            f"AMOUNT_MISMATCH ({pay_amt} vs {ord_amt})",
         )
         return False
 
-    # ---- Optional official API ----
-    api_result = verify_with_official_api(payment)
-    if api_result["checked"] and not api_result["verified"]:
-        log_verification(
-            payment, order["order_id"], "REJECTED",
-            "API_VERIFICATION_FAILED",
-        )
-        return False
-
-    verification_source = (
-        "GMAIL+ORDER_ID+UTR+TXN+OFFICIAL_API"
-        if api_result["checked"]
-        else "GMAIL+ORDER_ID+UTR+TXN"
-    )
-
-    # ---- Save ----
+    # Save
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn = get_db()
     try:
@@ -933,8 +729,8 @@ def verify_payment(payment):
             INSERT INTO payments (
                 amount, status, sender_name, transaction_id, utr,
                 gmail_uid, payment_date, order_id,
-                verification_source, created_at, verified_at, note
-            ) VALUES (?, 'VERIFIED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                created_at, verified_at, note
+            ) VALUES (?, 'VERIFIED', ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payment["amount"],
@@ -944,7 +740,6 @@ def verify_payment(payment):
                 payment["gmail_uid"],
                 payment["payment_date"],
                 order["order_id"],
-                verification_source,
                 now_str,
                 now_str,
                 f"Matched order {order['order_id']}",
@@ -977,7 +772,7 @@ def verify_payment(payment):
         conn.rollback()
         conn.close()
         log_verification(
-            payment, order["order_id"], "REJECTED", "INTEGRITY_ERROR"
+            payment, order_id, "REJECTED", "INTEGRITY"
         )
         return False
     finally:
@@ -986,15 +781,8 @@ def verify_payment(payment):
         except Exception:
             pass
 
-    log(
-        "PAYMENT | VERIFIED | "
-        f"ORDER={order['order_id']} | "
-        f"AMOUNT=₹{payment['amount']:.2f} | "
-        f"UTR={payment['utr']} | TXN={payment['transaction_id']}"
-    )
-    log_verification(
-        payment, order["order_id"], "VERIFIED", "ORDER_MATCHED"
-    )
+    log(f"PAYMENT | VERIFIED | order={order_id} | ₹{payment['amount']}")
+    log_verification(payment, order_id, "VERIFIED", "ORDER_MATCHED")
     return True
 
 
@@ -1008,7 +796,6 @@ def scan_gmail():
     with _scan_lock:
         now = time.time()
         if now - _last_scan_time < MIN_SCAN_INTERVAL:
-            log("SCANNER | SKIPPED (cooldown)")
             return
         _last_scan_time = now
 
@@ -1019,19 +806,17 @@ def scan_gmail():
 
     try:
         mail.select("INBOX", readonly=True)
-        since_date = (
+        since = (
             datetime.now() - timedelta(days=EMAIL_DAYS)
         ).strftime("%d-%b-%Y")
 
-        status, data = mail.uid(
-            "search", None, f"SINCE {since_date}"
-        )
+        status, data = mail.uid("search", None, f"SINCE {since}")
         if status != "OK":
             mail.logout()
             return
 
         uids = data[0].split()
-        famapp_found = 0
+        found = 0
         verified = 0
 
         for uid in reversed(uids):
@@ -1039,39 +824,33 @@ def scan_gmail():
                 status, md = mail.uid("fetch", uid, "(RFC822)")
                 if status != "OK":
                     continue
-                raw_email = None
+                raw = None
                 for item in md:
                     if isinstance(item, tuple):
-                        raw_email = item[1]
+                        raw = item[1]
                         break
-                if not raw_email:
+                if not raw:
                     continue
-
                 uid_text = (
                     uid.decode() if isinstance(uid, bytes)
                     else str(uid)
                 )
-                payment = parse_famapp_email(raw_email, uid_text)
+                payment = parse_famapp_email(raw, uid_text)
                 if not payment:
                     continue
-
-                famapp_found += 1
+                found += 1
                 if verify_payment(payment):
                     verified += 1
-
             except Exception as e:
-                log(f"SCANNER | EMAIL_ERROR={e}")
+                log(f"SCANNER | EMAIL_ERR | {e}")
 
-        log(
-            f"SCANNER | DONE | FOUND={famapp_found} | "
-            f"VERIFIED={verified}"
-        )
+        log(f"SCANNER | DONE | FOUND={found} | VERIFIED={verified}")
         try:
             mail.logout()
         except Exception:
             pass
     except Exception as e:
-        log(f"SCANNER | ERROR={e}")
+        log(f"SCANNER | ERROR | {e}")
         try:
             mail.logout()
         except Exception:
@@ -1079,24 +858,22 @@ def scan_gmail():
 
 
 def background_scanner():
-    log("BACKGROUND_SCANNER | STARTED")
     while True:
         try:
             scan_gmail()
-            cleanup_rate_store()
         except Exception as e:
-            log(f"BACKGROUND_SCANNER | ERROR={e}")
+            log(f"BG_SCANNER | ERROR | {e}")
         time.sleep(SCAN_INTERVAL)
 
 
 try:
     setup_database()
 except Exception as e:
-    log(f"INIT | DB_SETUP_ERROR={e}")
+    log(f"INIT | DB_ERROR | {e}")
 
 
 # ============================================================
-# API — QR
+# QR
 # ============================================================
 
 @app.route("/api/qr")
@@ -1126,17 +903,11 @@ def quick_qr():
 
 
 # ============================================================
-# API — Create Order
+# CREATE ORDER
 # ============================================================
 
 @app.route("/api/create-order", methods=["GET", "POST"])
 def create_order_api():
-    ip = get_client_ip()
-    allowed, _ = rate_limit("create-order", ip, 200)
-    if not allowed:
-        return jsonify({"success": False,
-                        "error": "Too many requests"}), 429
-
     data = (
         request.get_json(silent=True)
         or request.form
@@ -1154,13 +925,9 @@ def create_order_api():
                         "error": "Amount out of range"}), 400
 
     hint = (data.get("hint") or "").strip()[:20]
+    order = create_order(amount, hint)
 
-    order = create_order(amount, hint=hint)
-
-    log(
-        f"ORDER | CREATED | ID={order['order_id']} | "
-        f"AMOUNT=₹{amount}"
-    )
+    log(f"ORDER | CREATED | {order['order_id']} | ₹{amount}")
 
     return jsonify({
         "success": True,
@@ -1177,19 +944,22 @@ def create_order_api():
 
 
 # ============================================================
-# API — Order Status (main verification endpoint)
+# ORDER STATUS — FULL INFO ⭐
 # ============================================================
 
 @app.route("/api/order/<order_id>")
 def order_status(order_id):
     row = get_order_by_id(order_id)
     if not row:
-        return jsonify({"success": False,
-                        "error": "Order not found"}), 404
+        return jsonify({
+            "success": False,
+            "error": "Order not found"
+        }), 404
 
     o = dict(row)
 
-    # Compute remaining time
+    # Auto-expire if pending & past expires_at
+    remaining = 0
     try:
         expires = datetime.strptime(
             o["expires_at"], "%Y-%m-%d %H:%M:%S"
@@ -1198,7 +968,6 @@ def order_status(order_id):
     except Exception:
         remaining = 0
 
-    # Auto-mark expired if still pending
     if o["status"] == "PENDING" and remaining <= 0:
         conn = get_db()
         conn.execute(
@@ -1212,11 +981,90 @@ def order_status(order_id):
     o["remaining_seconds"] = max(remaining, 0)
     o["expired"] = remaining <= 0
 
-    return jsonify({"success": True, "order": o})
+    # Fetch linked payment (if any)
+    pay = get_payment_by_order(order_id)
+    payment_obj = dict(pay) if pay else None
+
+    # Verification block
+    utr_ok, utr_reason = validate_utr(o.get("utr") or "")
+    txn_ok, txn_reason = validate_txn(o.get("transaction_id") or "")
+
+    age_seconds = None
+    age_human_str = "unknown"
+    within_expiry = False
+    if o.get("payment_date"):
+        pdt = parse_payment_date(o["payment_date"])
+        if pdt:
+            age_seconds = int((now_ist() - pdt).total_seconds())
+            age_human_str = human_age(age_seconds)
+            within_expiry = (
+                age_seconds <= PAYMENT_EXPIRY_MINUTES * 60
+            )
+
+    verification = {
+        "utr_valid": utr_ok,
+        "utr_reason": utr_reason,
+        "txn_valid": txn_ok,
+        "txn_reason": txn_reason,
+        "age_seconds": age_seconds,
+        "age_human": age_human_str,
+        "within_expiry": within_expiry,
+        "expiry_minutes": PAYMENT_EXPIRY_MINUTES,
+    }
+
+    # Summary block (bot-friendly)
+    summary = {
+        "paid": o["status"] == "VERIFIED",
+        "amount_matches": None,
+        "sender": o.get("sender_name"),
+        "paid_at": o.get("payment_date"),
+        "reference_utr": o.get("utr"),
+        "reference_txn": o.get("transaction_id"),
+    }
+    if pay:
+        try:
+            summary["amount_matches"] = (
+                round(float(pay["amount"]), 2)
+                == round(float(o["amount"]), 2)
+            )
+        except Exception:
+            pass
+
+    return jsonify({
+        "success": True,
+        "order": {
+            # Basics
+            "order_id": o["order_id"],
+            "amount": o["amount"],
+            "status": o["status"],
+
+            # Timestamps
+            "created_at": o["created_at"],
+            "expires_at": o["expires_at"],
+            "verified_at": o["verified_at"],
+            "remaining_seconds": o["remaining_seconds"],
+            "expired": o["expired"],
+
+            # Payment fields (mirrored for convenience)
+            "utr": o.get("utr"),
+            "transaction_id": o.get("transaction_id"),
+            "sender_name": o.get("sender_name"),
+            "payment_date": o.get("payment_date"),
+
+            # Full payment object (if verified)
+            "payment": payment_obj,
+
+            # Verification details
+            "verification": verification,
+
+            # Bot-friendly summary
+            "summary": summary,
+        },
+    })
 
 
 # ============================================================
-# API — Cancel Order
+# CANCEL ORDER
 # ============================================================
 
 @app.route("/api/cancel-order", methods=["GET", "POST"])
@@ -1249,12 +1097,15 @@ def cancel_order_api():
     conn.commit()
     conn.close()
 
-    return jsonify({"success": True, "order_id": order_id,
-                    "status": "CANCELLED"})
+    return jsonify({
+        "success": True,
+        "order_id": order_id,
+        "status": "CANCELLED",
+    })
 
 
 # ============================================================
-# LOOKUP HELPERS
+# LOOKUPS
 # ============================================================
 
 @app.route("/api/verify-utr")
@@ -1263,7 +1114,7 @@ def verify_utr_lookup():
     if not utr:
         return jsonify({"success": False,
                         "error": "utr required"}), 400
-    ok, reason = validate_utr_format(utr)
+    ok, reason = validate_utr(utr)
     if not ok:
         return jsonify({"success": False,
                         "valid_format": False,
@@ -1274,13 +1125,17 @@ def verify_utr_lookup():
     ).fetchone()
     conn.close()
     if not row:
-        return jsonify({"success": True, "found": False,
-                        "utr": utr, "valid_format": True,
-                        "reason": reason})
-    return jsonify({"success": True, "found": True,
-                    "utr": utr, "valid_format": True,
-                    "reason": reason,
-                    "payment": dict(row)})
+        return jsonify({
+            "success": True, "found": False,
+            "utr": utr, "valid_format": True,
+            "reason": reason,
+        })
+    return jsonify({
+        "success": True, "found": True,
+        "utr": utr, "valid_format": True,
+        "reason": reason,
+        "payment": dict(row),
+    })
 
 
 @app.route("/api/verify-txn")
@@ -1289,7 +1144,7 @@ def verify_txn_lookup():
     if not txn:
         return jsonify({"success": False,
                         "error": "txn required"}), 400
-    ok, reason = validate_transaction_id(txn)
+    ok, reason = validate_txn(txn)
     if not ok:
         return jsonify({"success": False,
                         "valid_format": False,
@@ -1301,15 +1156,17 @@ def verify_txn_lookup():
     ).fetchone()
     conn.close()
     if not row:
-        return jsonify({"success": True, "found": False,
-                        "transaction_id": txn,
-                        "valid_format": True,
-                        "reason": reason})
-    return jsonify({"success": True, "found": True,
-                    "transaction_id": txn,
-                    "valid_format": True,
-                    "reason": reason,
-                    "payment": dict(row)})
+        return jsonify({
+            "success": True, "found": False,
+            "transaction_id": txn, "valid_format": True,
+            "reason": reason,
+        })
+    return jsonify({
+        "success": True, "found": True,
+        "transaction_id": txn, "valid_format": True,
+        "reason": reason,
+        "payment": dict(row),
+    })
 
 
 # ============================================================
@@ -1329,16 +1186,8 @@ def _admin_check():
 @app.route("/api/scan", methods=["GET", "POST"])
 def manual_scan():
     if not _admin_check():
-        security_log("UNAUTHORIZED_SCAN")
         return jsonify({"success": False,
                         "error": "Invalid admin_key"}), 401
-
-    ip = get_client_ip()
-    allowed, _ = rate_limit("scan", ip, MAX_SCAN_ATTEMPTS)
-    if not allowed:
-        return jsonify({"success": False,
-                        "error": "Too many scans"}), 429
-
     scan_gmail()
     return jsonify({
         "success": True,
@@ -1396,8 +1245,11 @@ def verification_logs():
             "SELECT * FROM verification_logs "
             "ORDER BY id DESC LIMIT 200"
         ).fetchall()
-        return jsonify({"success": True, "count": len(rows),
-                        "logs": [dict(r) for r in rows]})
+        return jsonify({
+            "success": True,
+            "count": len(rows),
+            "logs": [dict(r) for r in rows],
+        })
     finally:
         conn.close()
 
@@ -1410,8 +1262,6 @@ def verification_logs():
 def admin():
     provided = (request.args.get("admin_key") or "").strip()
     if provided != ADMIN_KEY:
-        if provided:
-            security_log("ADMIN_BAD_KEY")
         return render_template_string("""
 <!DOCTYPE html><html><head><meta charset="UTF-8">
 <title>Admin</title>
@@ -1463,27 +1313,21 @@ autofocus required>
 <!DOCTYPE html><html><head><meta charset="UTF-8">
 <title>FamApp Admin</title>
 <style>
-body{background:#0d0d0d;color:#eee;margin:0;
-font-family:Arial;padding:20px}
+body{background:#0d0d0d;color:#eee;margin:0;font-family:Arial;padding:20px}
 h1{margin:0 0 6px}
-h2{margin:30px 0 12px;font-size:16px;color:#aaa;
-text-transform:uppercase;letter-spacing:1px}
+h2{margin:30px 0 12px;font-size:16px;color:#aaa;text-transform:uppercase}
 .stats{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:20px}
-.card{background:#161616;border:1px solid #2a2a2a;
-border-radius:12px;padding:16px 20px;flex:1;min-width:150px}
+.card{background:#161616;border:1px solid #2a2a2a;border-radius:12px;
+padding:16px 20px;flex:1;min-width:150px}
 .card .lbl{font-size:11px;color:#888;text-transform:uppercase}
 .card b{display:block;font-size:24px;margin-top:6px}
-.green b{color:#42e695}.yellow b{color:#ffd166}
-.blue b{color:#5eb0ff}
+.green b{color:#42e695}.yellow b{color:#ffd166}.blue b{color:#5eb0ff}
 table{width:100%;border-collapse:collapse;background:#161616;
 border-radius:10px;overflow:hidden;font-size:13px}
-th,td{padding:10px 12px;border-bottom:1px solid #262626;
-text-align:left}
-th{background:#1f1f1f;color:#aaa;font-size:11px;
-text-transform:uppercase}
+th,td{padding:10px 12px;border-bottom:1px solid #262626;text-align:left}
+th{background:#1f1f1f;color:#aaa;font-size:11px;text-transform:uppercase}
 .mono{font-family:monospace;font-size:12px}
-.tag{padding:2px 8px;border-radius:6px;font-size:10px;
-font-weight:600}
+.tag{padding:2px 8px;border-radius:6px;font-size:10px;font-weight:600}
 .ok{background:#0f3a23;color:#42e695}
 .bad{background:#3a1010;color:#ff6b6b}
 .warn{background:#3a2e0f;color:#ffd166}
@@ -1495,12 +1339,9 @@ background:#2d6cdf;color:#fff;font-weight:600;cursor:pointer}
 <p>UPI: <b>{{ upi }}</b> · Expiry: {{ expiry }} min</p>
 
 <div class="stats">
-<div class="card green"><div class="lbl">Verified</div>
-<b>{{ verified }}</b></div>
-<div class="card blue"><div class="lbl">Total</div>
-<b>₹{{ "%.2f"|format(total_amt) }}</b></div>
-<div class="card yellow"><div class="lbl">Pending</div>
-<b>{{ pending }}</b></div>
+<div class="card green"><div class="lbl">Verified</div><b>{{ verified }}</b></div>
+<div class="card blue"><div class="lbl">Total</div><b>₹{{ "%.2f"|format(total_amt) }}</b></div>
+<div class="card yellow"><div class="lbl">Pending</div><b>{{ pending }}</b></div>
 </div>
 
 <button onclick="scan()">🔄 Scan Gmail</button>
@@ -1508,8 +1349,7 @@ background:#2d6cdf;color:#fff;font-weight:600;cursor:pointer}
 <h2>💳 Payments</h2>
 <table>
 <tr><th>ID</th><th>Amount</th><th>Status</th><th>Sender</th>
-<th>UTR</th><th>TXN</th><th>Order ID</th>
-<th>Payment Date</th></tr>
+<th>UTR</th><th>TXN</th><th>Order</th><th>Date</th></tr>
 {% for p in payments %}
 <tr>
 <td class="mono">{{ p["id"] }}</td>
@@ -1526,8 +1366,8 @@ background:#2d6cdf;color:#fff;font-weight:600;cursor:pointer}
 
 <h2>📦 Orders</h2>
 <table>
-<tr><th>Order ID</th><th>Amount</th><th>Status</th>
-<th>UTR</th><th>TXN</th><th>Created</th><th>Expires</th></tr>
+<tr><th>Order ID</th><th>Amount</th><th>Status</th><th>UTR</th>
+<th>TXN</th><th>Created</th><th>Expires</th></tr>
 {% for o in orders %}
 <tr>
 <td class="mono">{{ o["order_id"] }}</td>
@@ -1587,9 +1427,9 @@ async function scan(){
 @app.route("/")
 def home():
     return jsonify({
-        "name": "FamApp Gateway v5",
+        "name": "FamApp Gateway",
         "status": "online",
-        "note": "order_id = purpose",
+        "order_id_verification": True,
         "expiry_minutes": PAYMENT_EXPIRY_MINUTES,
         "endpoints": {
             "create_order": "/api/create-order?amount=100&hint=TG123",
@@ -1608,6 +1448,13 @@ def home():
 # ============================================================
 
 if __name__ == "__main__":
-    log("FamApp Gateway v5 — local dev")
-    threading.Thread(target=background_scanner, daemon=True).start()
-    app.run(host=HOST, port=PORT, debug=False, threaded=True)
+    log("FamApp Gateway — local dev")
+    threading.Thread(
+        target=background_scanner, daemon=True
+    ).start()
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8080)),
+        debug=False,
+        threaded=True,
+    )
