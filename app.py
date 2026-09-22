@@ -28,12 +28,13 @@ from pydantic import BaseModel
 
 
 # ============================================================
-# OS GATEWAY — UPI PAYMENT GATEWAY
-# Powered by MODX · Developer: @MODX
+# OS CODEX — UPI PAYMENT GATEWAY
+# Developer: @khannhamzaa
+# Powered by: OS CODEX
 # ============================================================
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("OS-GATEWAY")
+logger = logging.getLogger("OS-CODEX")
 
 
 # ============================================================
@@ -45,7 +46,7 @@ DATABASE_URL = "postgresql://neondb_owner:npg_USgbsX5pDRO4@ep-bold-art-avpvzvhx-
 MERCHANT_NAME   = "HAMZA KHAN"
 MERCHANT_UPI_ID = "khannhamzaa@fam"
 
-ADMIN_KEY      = "os-gateway@123"
+ADMIN_KEY      = "os-codex@123"
 WEBHOOK_SECRET = "change_me_random_secret"
 
 MAX_PAYMENT_AMOUNT     = 100000.0
@@ -59,11 +60,7 @@ ALLOWED_ORIGINS = ["*"]
 # ============================================================
 
 GMAIL_EMAIL = "hamza.ali.khan6200@gmail.com"
-
-GMAIL_APP_PASSWORD = os.environ.get(
-    "GMAIL_APP_PASSWORD",
-    "kdncbotxdmpaqeep"
-)
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "kdncbotxdmpaqeep")
 
 FAMAPP_SENDER = "famapp"
 EMAIL_CHECK_INTERVAL = 30
@@ -75,6 +72,14 @@ EMAIL_CHECK_INTERVAL = 30
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_ADMIN_ID = os.environ.get("TELEGRAM_ADMIN_ID", "")
+
+# ============================================================
+# BRANDING
+# ============================================================
+
+BRAND       = "OS CODEX"
+DEVELOPER   = "@khannhamzaa"
+POWERED_BY  = "OS CODEX"
 
 # ============================================================
 # END CONFIG
@@ -171,8 +176,6 @@ async def lifespan(app):
     if GMAIL_EMAIL and GMAIL_APP_PASSWORD:
         email_task = asyncio.create_task(scan_gmail_for_payments())
         logger.info("Gmail watcher started for %s", GMAIL_EMAIL)
-    else:
-        logger.info("Gmail watcher disabled")
 
     yield
 
@@ -188,7 +191,12 @@ async def lifespan(app):
 # APP
 # ============================================================
 
-app = FastAPI(title="OS GATEWAY", version="2.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="OS CODEX",
+    description="UPI Payment Gateway — by @khannhamzaa",
+    version="2.0.0",
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -247,7 +255,6 @@ async def find_merchant_by_api_key(api_key: str) -> Optional[str]:
 
 async def _mark_order_success(order_id: str, txn_id: str, source: str,
                               upi_ref: str = None, payer: str = None):
-    """Marks an order SUCCESS + fires webhook + TG notify."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         order = await conn.fetchrow("SELECT * FROM orders WHERE order_id=$1", order_id)
@@ -287,7 +294,8 @@ async def _mark_order_success(order_id: str, txn_id: str, source: str,
                     "status": "SUCCESS",
                     "verified_by": source,
                     "timestamp": now_iso(),
-                    "gateway": "OS GATEWAY",
+                    "gateway": BRAND,
+                    "developer": DEVELOPER,
                 })
         except Exception as e:
             logger.warning("Merchant webhook failed: %s", e)
@@ -304,7 +312,6 @@ async def _mark_order_success(order_id: str, txn_id: str, source: str,
 
 
 async def _expire_order_if_needed(order_id: str):
-    """Marks order EXPIRED if past expiry. Returns current status."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         order = await conn.fetchrow("SELECT * FROM orders WHERE order_id=$1", order_id)
@@ -329,9 +336,9 @@ async def _expire_order_if_needed(order_id: str):
 async def health():
     return {
         "success": True,
-        "service": "OS GATEWAY",
-        "powered_by": "MODX",
-        "developer": "@MODX",
+        "service": BRAND,
+        "powered_by": POWERED_BY,
+        "developer": DEVELOPER,
         "status": "online",
         "features": {
             "email_auto_verify": bool(GMAIL_EMAIL and GMAIL_APP_PASSWORD),
@@ -389,8 +396,8 @@ async def create_merchant(
         "merchant_id": merchant_id,
         "api_key": raw_key,
         "name": name,
-        "gateway": "OS GATEWAY",
-        "developer": "@MODX",
+        "gateway": BRAND,
+        "developer": DEVELOPER,
     }
 
 
@@ -539,6 +546,8 @@ async def _create_order(merchant_id, amount, idempotency_key, request):
                     "payment_url": f"{base_url}/pay/{existing['order_id']}",
                     "upi_uri": upi,
                     "qr_code": qr,
+                    "gateway": BRAND,
+                    "developer": DEVELOPER,
                 }
 
         merchant = await conn.fetchrow(
@@ -575,8 +584,8 @@ async def _create_order(merchant_id, amount, idempotency_key, request):
         "qr_code": qr,
         "expires_at": expires.isoformat(),
         "expiry_minutes": PAYMENT_EXPIRY_MINUTES,
-        "gateway": "OS GATEWAY",
-        "developer": "@MODX",
+        "gateway": BRAND,
+        "developer": DEVELOPER,
     }
 
 
@@ -605,6 +614,8 @@ async def payment_status(order_id: str = Query(...)):
         "expires_at": order["expires_at"].isoformat(),
         "expired": st == "EXPIRED",
         "can_verify": st == "PENDING",
+        "gateway": BRAND,
+        "developer": DEVELOPER,
     }
 
 
@@ -668,7 +679,14 @@ async def provider_webhook(body: WebhookBody):
             source="Webhook",
         )
 
-    return {"success": True, "message": "Webhook processed"}
+    return {
+        "success": True,
+        "message": "Webhook processed",
+        "order_id": body.order_id,
+        "status": final,
+        "gateway": BRAND,
+        "developer": DEVELOPER,
+    }
 
 
 # ============================================================
@@ -702,7 +720,6 @@ async def verify_utr(body: UtrBody):
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # duplicate UTR check
         if txn:
             existing = await conn.fetchrow(
                 "SELECT order_id FROM orders WHERE transaction_id=$1 AND status='SUCCESS'",
@@ -723,16 +740,16 @@ async def verify_utr(body: UtrBody):
         if not order:
             raise HTTPException(404, {"code": "ORDER_NOT_FOUND", "message": "Order not found"})
 
-        # already success
         if order["status"] == "SUCCESS":
             return {
                 "success": True,
                 "message": "Order already SUCCESS",
                 "order_id": order["order_id"],
                 "transaction_id": order["transaction_id"],
+                "gateway": BRAND,
+                "developer": DEVELOPER,
             }
 
-        # already failed/expired
         if order["status"] in ("EXPIRED", "FAILED"):
             raise HTTPException(
                 410,
@@ -740,7 +757,6 @@ async def verify_utr(body: UtrBody):
                  "message": f"Order is {order['status']} — cannot verify"},
             )
 
-        # time window
         if now() > order["expires_at"]:
             await conn.execute(
                 "UPDATE orders SET status='EXPIRED', updated_at=$1 WHERE order_id=$2",
@@ -773,6 +789,8 @@ async def verify_utr(body: UtrBody):
         "amount": float(order["amount"]),
         "verified_by": "UTR",
         "seconds_remaining_at_verify": seconds_left,
+        "gateway": BRAND,
+        "developer": DEVELOPER,
     }
 
 
@@ -957,6 +975,7 @@ async def _notify_telegram_admin(
         text += f"📎 UPI Ref: `{upi_reference}`\n"
     if source:
         text += f"✅ Verified via: *{source}*\n"
+    text += f"\n— {BRAND} · {DEVELOPER}"
 
     try:
         async with httpx.AsyncClient(timeout=10) as tg:
@@ -980,7 +999,8 @@ async def _notify_telegram_expiry(order_id: str, amount: float):
         f"🆔 Order: `{order_id}`\n"
         f"💵 Amount: *₹{amount:.2f}*\n"
         f"⏱️ Window: {PAYMENT_EXPIRY_MINUTES} minutes\n"
-        "❌ No UTR submitted in time"
+        "❌ No UTR submitted in time\n\n"
+        f"— {BRAND} · {DEVELOPER}"
     )
     try:
         async with httpx.AsyncClient(timeout=10) as tg:
@@ -997,7 +1017,7 @@ async def _notify_telegram_expiry(order_id: str, amount: float):
 
 
 # ============================================================
-# 11. PAYMENT PAGE (with UTR input + expiry display)
+# 11. PAYMENT PAGE
 # ============================================================
 
 @app.get("/pay/{order_id}", response_class=HTMLResponse)
@@ -1013,7 +1033,6 @@ async def payment_page(order_id: str):
     is_success = status == "SUCCESS"
     is_expired = status in ("EXPIRED", "FAILED")
 
-    # time remaining
     if is_active:
         secs = max(0, int((order["expires_at"] - now()).total_seconds()))
     else:
@@ -1022,7 +1041,6 @@ async def payment_page(order_id: str):
     created_str = order["created_at"].strftime("%d %b %Y, %I:%M %p UTC")
     expires_str = order["expires_at"].strftime("%d %b %Y, %I:%M %p UTC")
 
-    # Status-specific top block
     if is_success:
         top_block = f"""
         <div class="result success-block">
@@ -1061,7 +1079,7 @@ async def payment_page(order_id: str):
     return HTMLResponse(f"""
 <!DOCTYPE html><html><head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>OS GATEWAY — Payment Details</title>
+<title>{BRAND} — Payment Details</title>
 <style>
 *{{box-sizing:border-box}}
 body{{margin:0;background:linear-gradient(135deg,#0f172a,#1e293b);
@@ -1105,15 +1123,10 @@ background:#a855f7;color:#fff;font-weight:700;cursor:pointer;font-size:14px}}
 .expired-block .result-title{{color:#ef4444}}
 .result-amount{{font-size:32px;font-weight:800;color:#e2e8f0;margin:8px 0}}
 .result-sub{{font-size:13px;color:#94a3b8;margin-top:6px}}
-.badge{{display:inline-block;padding:4px 10px;border-radius:999px;font-size:11px;
-font-weight:700;letter-spacing:.5px;margin-top:8px}}
-.badge.ok{{background:#10b981;color:#fff}}
-.badge.bad{{background:#ef4444;color:#fff}}
-.badge.warn{{background:#facc15;color:#000}}
 .footer{{margin-top:20px;font-size:12px;color:#64748b;text-align:center}}
 </style></head><body>
 <div class="card">
-  <div class="brand">OS <b>GATEWAY</b></div>
+  <div class="brand">OS <b>CODEX</b></div>
   <h2>{MERCHANT_NAME}</h2>
 
   <div class="amount">₹{float(order["amount"]):.2f}</div>
@@ -1134,7 +1147,7 @@ font-weight:700;letter-spacing:.5px;margin-top:8px}}
     {f'<div class="row"><span class="k">Verified Via</span><span class="v">{order["verified_by"]}</span></div>' if order["verified_by"] else ''}
   </div>
 
-  <div class="footer">OS GATEWAY · Powered by MODX</div>
+  <div class="footer">{BRAND} · Developer {DEVELOPER}</div>
 </div>
 
 <script>
@@ -1148,11 +1161,7 @@ function startTimer() {{
   if (!el) return;
   timerHandle = setInterval(() => {{
     remaining -= 1;
-    if (remaining <= 0) {{
-      clearInterval(timerHandle);
-      location.reload();
-      return;
-    }}
+    if (remaining <= 0) {{ clearInterval(timerHandle); location.reload(); return; }}
     el.innerText = remaining;
     if (remaining < 60) el.style.color = "#ef4444";
   }}, 1000);
@@ -1166,7 +1175,7 @@ async function checkStatus() {{
     const sEl = document.getElementById("statusText");
     if (sEl && sEl.innerText !== d.status) {{
       sEl.innerText = d.status;
-      if (d.status === "SUCCESS" || d.status === "EXPIRED" || d.status === "FAILED") {{
+      if (["SUCCESS","EXPIRED","FAILED"].includes(d.status)) {{
         setTimeout(() => location.reload(), 800);
       }}
     }}
@@ -1177,26 +1186,18 @@ async function submitUTR() {{
   const input = document.getElementById("utrInput");
   const msg = document.getElementById("utrMsg");
   const utr = input.value.trim();
-
   if (utr.length < 6) {{
     msg.innerHTML = '<span style="color:#ef4444">❌ UTR too short — min 6 characters</span>';
     return;
   }}
-
   msg.innerHTML = '<span style="color:#facc15">⏳ Verifying...</span>';
-
   try {{
     const r = await fetch("/api/pay/verify-utr", {{
       method: "POST",
       headers: {{ "Content-Type": "application/json" }},
-      body: JSON.stringify({{
-        order_id: ORDER_ID,
-        utr: utr,
-        secret: "change_me_random_secret"
-      }})
+      body: JSON.stringify({{ order_id: ORDER_ID, utr: utr, secret: "change_me_random_secret" }})
     }});
     const d = await r.json();
-
     if (r.ok && d.success) {{
       msg.innerHTML = '<span style="color:#10b981">✅ Verified! Refreshing...</span>';
       setTimeout(() => location.reload(), 1200);
