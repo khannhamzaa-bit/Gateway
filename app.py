@@ -213,8 +213,8 @@ async def health():
     return {
         "success": True,
         "service": "OS GATEWAY",
-        "powered_by": "MODX",
-        "developer": "@MODX",
+        "powered_by": "OS CODEX",
+        "developer": "@khannhamzaa",
         "status": "online",
     }
 
@@ -266,7 +266,7 @@ async def create_merchant(
         "api_key": raw_key,
         "name": name,
         "gateway": "OS GATEWAY",
-        "developer": "@MODX",
+        "developer": "@khannhamzaa",
     }
 
 
