@@ -24,7 +24,6 @@ from pydantic import BaseModel
 # ============================================================
 # OS GATEWAY — UPI PAYMENT GATEWAY
 # Powered by MODX · Developer: @MODX
-# 100% header-free — everything via URL/body
 # ============================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -32,22 +31,34 @@ logger = logging.getLogger("OS-GATEWAY")
 
 
 # ============================================================
-# CONFIG
+# ⚙️ HARDCODED CONFIG — EDIT THIS BLOCK ONLY
 # ============================================================
 
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-DB_SSL       = os.getenv("DB_SSL", "require")
+# 🔴 PASTE YOUR FREE POSTGRES URL HERE (from neon.tech)
+DATABASE_URL = "postgresql://user:password@host:5432/dbname?sslmode=require"
 
-MERCHANT_NAME   = os.getenv("MERCHANT_NAME", "")
-MERCHANT_UPI_ID = os.getenv("MERCHANT_UPI_ID", "")
+# Merchant info (yours)
+MERCHANT_NAME   = "HAMZA KHAN"
+MERCHANT_UPI_ID = "khannhamzaa@fam"
 
-ADMIN_KEY      = os.getenv("ADMIN_KEY", "")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+# Admin key (to create merchant API keys)
+ADMIN_KEY = "os-gateway@123"
 
-MAX_PAYMENT_AMOUNT     = float(os.getenv("MAX_PAYMENT_AMOUNT", "100000"))
-PAYMENT_EXPIRY_MINUTES = int(os.getenv("PAYMENT_EXPIRY_MINUTES", "15"))
+# Webhook shared secret (optional — used inside webhook body)
+WEBHOOK_SECRET = "change_me_random_secret"
 
-ALLOWED_ORIGINS = [x.strip() for x in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
+# Limits
+MAX_PAYMENT_AMOUNT     = 100000.0
+PAYMENT_EXPIRY_MINUTES = 15
+
+# CORS
+ALLOWED_ORIGINS = ["*"]
+
+DB_SSL = "require"
+
+# ============================================================
+# END OF CONFIG
+# ============================================================
 
 
 # ============================================================
@@ -60,8 +71,6 @@ _pool: Optional[asyncpg.Pool] = None
 async def get_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
-        if not DATABASE_URL:
-            raise RuntimeError("DATABASE_URL not set")
         _pool = await asyncpg.create_pool(
             DATABASE_URL,
             min_size=1, max_size=5,
@@ -113,6 +122,7 @@ async def init_db():
 async def lifespan(app):
     try:
         await init_db()
+        logger.info("DB ready")
     except Exception as e:
         logger.warning("DB init skipped: %s", e)
     yield
@@ -145,6 +155,7 @@ def now(): return datetime.now(timezone.utc)
 def now_iso(): return now().isoformat()
 def hash_key(v): return hashlib.sha256(v.encode()).hexdigest()
 
+
 def generate_order_id():
     return "ORD_" + now().strftime("%Y%m%d%H%M%S") + "_" + secrets.token_hex(5).upper()
 
@@ -158,7 +169,10 @@ def generate_upi_qr(amount: float, order_id: str):
         "cu": "INR",
     }
     upi_uri = "upi://pay?" + urllib.parse.urlencode(params)
-    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=8, border=4)
+    qr = qrcode.QRCode(
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=8, border=4,
+    )
     qr.add_data(upi_uri)
     qr.make(fit=True)
     img = qr.make_image(fill_color="black", back_color="white")
@@ -188,15 +202,14 @@ async def health():
     return {
         "success": True,
         "service": "OS GATEWAY",
-        "powered_by": "OS CODEX",
-        "developer": "@khannhamzaa",
+        "powered_by": "MODX",
+        "developer": "@MODX",
         "status": "online",
     }
 
 
 # ============================================================
-# 2. ADMIN — CREATE MERCHANT
-#    GET /api/admin/create-merchant?admin_key=...&name=...&webhook_url=...
+# 2. CREATE MERCHANT (admin, direct URL)
 # ============================================================
 
 @app.get("/api/admin/create-merchant")
@@ -205,8 +218,6 @@ async def create_merchant(
     name: str = Query(...),
     webhook_url: Optional[str] = Query(None),
 ):
-    if not ADMIN_KEY:
-        raise HTTPException(503, {"code": "ADMIN_NOT_CONFIGURED", "message": "ADMIN_KEY missing"})
     if admin_key != ADMIN_KEY:
         raise HTTPException(401, {"code": "INVALID_ADMIN_KEY", "message": "Wrong admin key"})
 
@@ -235,8 +246,7 @@ async def create_merchant(
 
 
 # ============================================================
-# 3. LIST MERCHANTS (admin)
-#    GET /api/admin/merchants?admin_key=...
+# 3. LIST MERCHANTS
 # ============================================================
 
 @app.get("/api/admin/merchants")
@@ -267,7 +277,6 @@ async def list_merchants(admin_key: str = Query(...)):
 
 # ============================================================
 # 4. CREATE PAYMENT — GET
-#    /api/pay/create?amount=100&api_key=key_live_xxx
 # ============================================================
 
 @app.get("/api/pay/create")
@@ -290,8 +299,7 @@ async def create_payment_get(
 
 
 # ============================================================
-# 5. CREATE PAYMENT — POST (body)
-#    {"api_key":"...","amount":100,"idempotency_key":"..."}
+# 5. CREATE PAYMENT — POST
 # ============================================================
 
 class PaymentBody(BaseModel):
@@ -376,7 +384,6 @@ async def _create_order(merchant_id, amount, idempotency_key, request):
 
 # ============================================================
 # 6. STATUS
-#    GET /api/pay/status?order_id=ORD_xxx
 # ============================================================
 
 @app.get("/api/pay/status")
@@ -408,9 +415,7 @@ async def payment_status(order_id: str = Query(...)):
 
 
 # ============================================================
-# 7. PROVIDER WEBHOOK — accepts unsigned JSON (no headers)
-#    POST /api/pay/webhook
-#    {"order_id":"...","transaction_id":"...","amount":100,"status":"SUCCESS"}
+# 7. PROVIDER WEBHOOK
 # ============================================================
 
 class WebhookBody(BaseModel):
@@ -419,12 +424,11 @@ class WebhookBody(BaseModel):
     amount: float
     status: str
     upi_reference: Optional[str] = None
-    secret: Optional[str] = None  # optional: pass WEBHOOK_SECRET in body
+    secret: Optional[str] = None
 
 
 @app.post("/api/pay/webhook")
 async def provider_webhook(body: WebhookBody):
-    # Optional shared-secret check via body
     if WEBHOOK_SECRET and body.secret != WEBHOOK_SECRET:
         raise HTTPException(401, {"code": "INVALID_SECRET", "message": "Wrong webhook secret"})
 
